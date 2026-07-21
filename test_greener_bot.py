@@ -3,7 +3,7 @@
 Run: python3 test_combo_bot.py  (all must pass before deploy)."""
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # import gladiator_bot from THIS dir -> standalone-safe (no hardcoded repo path)
-import gladiator_bot as c
+import greener_bot as c
 
 P = F = 0
 def ok(cond, name):
@@ -842,6 +842,115 @@ c.TOTAL_SLOTS = 4
 s4 = c.short_notional(70.0, 0.005, 1.0)
 ok(s4 > s5 and abs(s4/s5 - 1.25) < 0.01, f"sizing scales with the divisor: notional x1.25 at 4 slots ({s5:.1f} -> {s4:.1f})")
 c.TOTAL_SLOTS = _svts["ts"]; c.S_FADE_CAP = _svts["fc"]
+
+print("\n=== GREENER: S1 liq-at-fill gate (GR_FILL_LIQ_MIN) — arm fail-closed + pending drop ===")
+_svg = dict(g=c.GR_FILL_LIQ_MIN, l30=c.liq30, live=c.LIVE, ca=c.cancel, os_=c.order_status, lp=c.live_positions, pn=c.price_now)
+c.LIVE = True; c.live_positions = lambda: {}; c.price_now = lambda s: 0.35
+c.GR_FILL_LIQ_MIN = 1000.0
+_gcalls = {"cancel": []}
+c.cancel = lambda sym, oid: (_gcalls["cancel"].append((sym, oid)), {"orderId": oid})[1]
+c.order_status = lambda sym, oid: {"status": "NEW", "executedQty": "0"}
+def _gpos():
+    return {"coin": "LIQUSDT", "state": "PENDING", "oid": 7001, "entry": 0.35, "qty": 100.0, "stop": 0.3553,
+            "tp": None, "tp_oid": None, "sl_oid": None, "ts": c.now(), "fill_deadline": c.now()+9999,
+            "cts": 1, "tf": "15m", "risk_frac": 0.015, "minlow": None, "added": False}
+# catalyst died -> pending cancelled
+c.liq30 = lambda s: 200.0
+stq = {"long": [], "short": [_gpos()], "mom": [], "snap": [], "trend": [], "squeeze": [], "wins": 0, "losses": 0,
+       "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}}
+c.manage_short(stq)
+ok(len(stq["short"]) == 0 and _gcalls["cancel"] == [("LIQUSDT", 7001)],
+   "pending retest CANCELLED when liq30 drops below the floor (catalyst died -> S-LIQDROP)")
+# catalyst alive -> pending survives
+_gcalls["cancel"].clear()
+c.liq30 = lambda s: 5000.0
+stq2 = {"long": [], "short": [_gpos()], "mom": [], "snap": [], "trend": [], "squeeze": [], "wins": 0, "losses": 0,
+        "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}}
+c.manage_short(stq2)
+ok(len(stq2["short"]) == 1 and not _gcalls["cancel"], "pending survives while liq30 >= floor")
+# data outage while pending -> tolerated (no cancel; TTL still guards)
+c.liq30 = lambda s: None
+stq3 = {"long": [], "short": [_gpos()], "mom": [], "snap": [], "trend": [], "squeeze": [], "wins": 0, "losses": 0,
+        "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}}
+c.manage_short(stq3)
+ok(len(stq3["short"]) == 1, "liq data outage while PENDING is tolerated (fail-closed applies at ARM, not mid-flight)")
+# gate off -> byte-identical (no liq30 consulted)
+c.GR_FILL_LIQ_MIN = 0.0
+_probe = {"n": 0}
+c.liq30 = lambda s: (_probe.__setitem__("n", _probe["n"] + 1), 0.0)[1]
+stq4 = {"long": [], "short": [_gpos()], "mom": [], "snap": [], "trend": [], "squeeze": [], "wins": 0, "losses": 0,
+        "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}}
+c.manage_short(stq4)
+ok(_probe["n"] == 0, "GR_FILL_LIQ_MIN=0: liq30 never consulted (default byte-identical)")
+c.GR_FILL_LIQ_MIN = _svg["g"]; c.liq30 = _svg["l30"]; c.LIVE = _svg["live"]; c.cancel = _svg["ca"]
+c.order_status = _svg["os_"]; c.live_positions = _svg["lp"]; c.price_now = _svg["pn"]
+
+print("\n=== GREENER: E5 squeeze-fade — slots, book math, exits ===")
+_sve = dict(sqe=c.SQF_ENABLED, cap=c.SQF_CAP, live=c.LIVE, pn=c.price_now, lp=c.live_positions,
+            rc=c.real_close_fill, cg=c.cancel_algo, mb=c.mkt_buy_close)
+def _sqst(**kw):
+    b = {"long": [], "short": [], "mom": [], "snap": [], "trend": [], "squeeze": [], "wins": 0, "losses": 0,
+         "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}, "fade_streak": 0}
+    b.update(kw); return b
+c.SQF_CAP = 1
+ok(c.can_open(_sqst(), "squeeze"), "squeeze can open on an empty book")
+ok(not c.can_open(_sqst(squeeze=[{"coin": "A"}]), "squeeze"), "SQF_CAP=1 blocks the 2nd squeeze")
+c.SQF_CAP = 0
+ok(not c.can_open(_sqst(), "squeeze"), "SQF_CAP=0: engine takes no slots (default inert)")
+c.SQF_CAP = 1
+# book(): squeeze is SHORT-direction with taker/taker fees
+stb_sq = _sqst()
+c.book(stb_sq, "squeeze", {"coin": "SQ1", "entry": 100.0, "qty": 1.0}, 99.0, "TIME")   # price fell 1% -> short WIN
+exp = (100.0-99.0)/100.0*100 - (c.FEE_TK + c.FEE_TK)                                    # taker entry + taker TIME exit
+ok(abs(stb_sq["realized"] - exp) < 1e-9 and stb_sq["wins"] == 1,
+   "book(squeeze): SHORT-direction pnl with taker+taker fees (price fell => win)")
+stb_sq2 = _sqst(fade_streak=0)
+c.book(stb_sq2, "squeeze", {"coin": "SQ2", "entry": 100.0, "qty": 1.0}, 104.0, "SL")   # +4% catastrophe stop
+ok(stb_sq2["losses"] == 1 and stb_sq2["fade_streak"] == 1 and "SQ2" in stb_sq2["fade_sl_ts"],
+   "a squeeze SL feeds the SHORT-SIDE counters (streak + per-coin ts) — side-aware breaker")
+# manage_squeeze: TIME exit fires after hold
+c.LIVE = False; c.price_now = lambda s: 99.5
+st_t = _sqst(squeeze=[{"coin": "TQ", "state": "OPEN", "entry": 100.0, "qty": 1.0, "stop": 104.0, "sl_oid": None,
+                        "ts": c.now(), "fill_ts": c.now() - (c.SQF_HOLD_MIN*60 + 5), "maxadv": 100.0}])
+c.manage_squeeze(st_t)
+ok(len(st_t["squeeze"]) == 0 and st_t["wins"] == 1, "TIME exit covers the short after SQF_HOLD_MIN (booked as a win at 99.5)")
+# manage_squeeze: catastrophe stop
+c.price_now = lambda s: 104.2
+st_s = _sqst(squeeze=[{"coin": "TQ2", "state": "OPEN", "entry": 100.0, "qty": 1.0, "stop": 104.0, "sl_oid": None,
+                        "ts": c.now(), "fill_ts": c.now(), "maxadv": 100.0}])
+c.manage_squeeze(st_s)
+ok(len(st_s["squeeze"]) == 0 and st_s["losses"] == 1, "catastrophe stop (+4%) closes and books the loss")
+# open_squeeze respects the short-side book pause
+c.SQF_ENABLED = True
+_sq_probe = {"n": 0}
+c.squeeze_signal = lambda s: (_sq_probe.__setitem__("n", _sq_probe["n"] + 1), None)[1]
+st_p = _sqst(book_paused_until=c.now() + 999)
+c._LAST_SQ_BAR[0] = -1
+_svbbn = c.S_BOOK_BREAKER_N; c.S_BOOK_BREAKER_N = 2
+c.open_squeeze(st_p, ["AUSDT"])
+ok(_sq_probe["n"] == 0, "open_squeeze BLOCKED during the short-side book-wide pause (never scans)")
+c.S_BOOK_BREAKER_N = _svbbn
+c.SQF_ENABLED = _sve["sqe"]; c.SQF_CAP = _sve["cap"]; c.LIVE = _sve["live"]; c.price_now = _sve["pn"]
+c.live_positions = _sve["lp"]; c.real_close_fill = _sve["rc"]; c.cancel_algo = _sve["cg"]; c.mkt_buy_close = _sve["mb"]
+
+print("\n=== GREENER: snap ORPHAN-FIX + cross-leg same-coin exclusion ===")
+_svs = dict(live=c.LIVE, lp=c.live_positions, ca=c.cancel, sm=c.stop_market_sell, sp=c.specs, pn=c.price_now)
+c.LIVE = True; c.specs = lambda s: {"tick": 0.0001, "pp": 4, "step": 0.1, "qp": 1}
+c.price_now = lambda s: 1.0
+_scalls = {"cancel": []}
+c.cancel = lambda sym, oid: (_scalls["cancel"].append((sym, oid)), {"orderId": oid})[1]
+c.stop_market_sell = lambda sym, trig: {"algoId": 900}
+c.live_positions = lambda: {("SNPUSDT", "LONG" if c.HEDGE else "BOTH"): 55.0}
+st_sn = _sqst(snap=[{"coin": "SNPUSDT", "state": "PENDING", "oid": 8001, "entry": 1.0, "qty": 100.0, "stop": 0.99,
+                     "tp": 1.008, "created": c.now(), "fill_ts": None}])
+c.manage_snapback(st_sn)
+p = st_sn["snap"][0]
+ok(p["state"] == "OPEN" and _scalls["cancel"] == [("SNPUSDT", 8001)] and abs(p["qty"] - 55.0) < 1e-9,
+   "snap A-FILL: entry-limit remainder CANCELLED + qty taken from the EXCHANGE amt (orphan can't be born)")
+ok("SNPUSDT" in c.held_all(_sqst(snap=[{"coin": "SNPUSDT"}])) and "SNPUSDT" in c.held_all(_sqst(squeeze=[{"coin": "SNPUSDT"}])),
+   "held_all sees coins across ALL legs (cross-leg same-coin exclusion input)")
+c.LIVE = _svs["live"]; c.live_positions = _svs["lp"]; c.cancel = _svs["ca"]; c.stop_market_sell = _svs["sm"]
+c.specs = _svs["sp"]; c.price_now = _svs["pn"]
 
 print(f"\n{'='*40}\n{P} passed, {F} failed")
 sys.exit(1 if F else 0)

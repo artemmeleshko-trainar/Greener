@@ -221,6 +221,26 @@ S_BOOK_COOLDOWN_SEC = float(os.environ.get("S_BOOK_COOLDOWN_SEC", "3600"))  # ho
 # to breakeven. RED (px>=entry) closes now at market ~breakeven; GREEN (px<entry) keeps its TP and rests the stop at breakeven (a reverting
 # winner can still run). Booked with tag "BE" so these squeeze-guard exits do NOT feed the streak/book counters (no cascade). 0 = OFF.
 S_BOOK_BE_TIGHTEN = int(os.environ.get("S_BOOK_BE_TIGHTEN", "0"))
+# ===== GREENER (21-07): S1 LIQ-AT-FILL GATE — candidate #1 of the WR70 study (84.4% WR / +0.136%/tr on 64 real fills w/ measured
+# slippage; the 12-07 arm-time gate is DEAD on the full tape — the catalyst must be alive AT THE FILL, not at the signal).
+# Mechanics: (a) arming a fade requires trailing-30min LONG-liq >= GR_FILL_LIQ_MIN (FAIL-CLOSED: data None -> no arm — 2 of 4
+# slots depend on liq data, silence must not fire blind fades); (b) a PENDING retest is CANCELLED the minute liq30 drops below
+# the floor (the resting limit may only fill while the catalyst is alive = reproduces the studied population). 0 = OFF (inert).
+GR_FILL_LIQ_MIN = float(os.environ.get("GR_FILL_LIQ_MIN", "0"))
+# ===== GREENER E5 SQUEEZE-FADE (ported from clever-bot 21-07; 4/4 OOS +0.297%/tr on the long tape, ~48% WR BY DESIGN — time-exit
+# engine, judged on expectancy not WR): taker market SELL into a SHORT-liq flush spike (shorts liquidating = price spiking up =
+# fade it), exit = TIME (SQF_HOLD_MIN) or the WIDE catastrophe stop (+SQF_SL). NO TP / NO trail (validated: tight exits are all
+# net-negative on this engine). Port notes: U1/ledger/allocator stripped (clever-bot brain, not needed); PUMP CHECK RUNS FIRST
+# (free Binance klines) and the Coinalyze liq call runs ONLY for coins already pumping -> ~0-10 calls/min, inside the 40/min
+# free tier (clever-bot's 150-coin liq sweep would 429). DEFAULT OFF (SQF_ENABLED=0) = byte-identical.
+SQF_ENABLED       = os.environ.get("SQF_ENABLED", "0") not in ("0", "false", "False", "no")
+SQF_S5_MIN        = float(os.environ.get("SQF_S5_MIN", "12000"))    # short-liq $ over trailing 5min >= this
+SQF_DOM           = float(os.environ.get("SQF_DOM", "2.0"))         # short-liq dominates: S15 > SQF_DOM * L15
+SQF_PUMP_MIN      = float(os.environ.get("SQF_PUMP_MIN", "1.0"))    # prior-15m pump >= this % (checked FIRST, before any liq call)
+SQF_HOLD_MIN      = int(os.environ.get("SQF_HOLD_MIN", "60"))       # TIME exit (minutes). No take-profit.
+SQF_SL            = float(os.environ.get("SQF_SL", "0.04"))         # catastrophe stop ONLY (+4%)
+SQF_CAP           = int(os.environ.get("SQF_CAP", "0"))             # max concurrent squeeze-fades. 0 = engine takes no slots.
+SQF_COOLDOWN_MIN  = int(os.environ.get("SQF_COOLDOWN_MIN", "60"))   # one squeeze-fade per coin per this many minutes
 
 # ========================= MOMENTUM LEG (v4 config A "Drive") — ported from momentum_engine.py =========================
 # THIRD strategy merged into the shared pool: LONG-ONLY multi-setup momentum on a MOVERS universe (full perp pool ranked
@@ -317,7 +337,7 @@ def fmt(p): return f"{p:.6g}"
 
 # ========================= STATE =========================
 def load_state():
-    base = {"equity": 0.0, "long": [], "short": [], "mom": [], "snap": [], "trend": [], "realized": 0.0, "wins": 0, "losses": 0,
+    base = {"equity": 0.0, "long": [], "short": [], "mom": [], "snap": [], "trend": [], "squeeze": [], "realized": 0.0, "wins": 0, "losses": 0,
             "loss_streak": 0, "paused_until": 0, "last_sig": {}, "slot_turn": "short", "lbreadth": 0, "sfires": 0,
             "fade_streak": 0, "fade_paused_until": 0, "fade_sl_ts": {}, "fade_pause_logged": 0, "fade_cd_logged": {},
             "day": "", "day_eq": 0.0, "muni_ts": 0}
@@ -617,7 +637,12 @@ def held_short(st): return {p["coin"] for p in st["short"]}
 def held_mom(st): return {p["coin"] for p in st.get("mom", [])}
 def held_snap(st): return {p["coin"] for p in st.get("snap", [])}
 def held_trend(st): return {p["coin"] for p in st.get("trend", [])}
-def n_open(st): return len(st["long"]) + len(st["short"]) + len(st.get("mom", [])) + len(st.get("snap", [])) + len(st.get("trend", []))
+def held_squeeze(st): return {p["coin"] for p in st.get("squeeze", [])}
+def held_all(st):
+    """GREENER cross-leg same-coin exclusion: one symbol may live in ONE leg at a time (a same-coin L/S pair in hedge
+    mode = pure fee bleed; two shorts on one coin = one doubled bet)."""
+    return held_long(st) | held_short(st) | held_mom(st) | held_snap(st) | held_trend(st) | held_squeeze(st)
+def n_open(st): return len(st["long"]) + len(st["short"]) + len(st.get("mom", [])) + len(st.get("snap", [])) + len(st.get("trend", [])) + len(st.get("squeeze", []))
 def n_long_total(st): return len(st["long"]) + len(st.get("mom", [])) + len(st.get("snap", [])) + len(st.get("trend", []))   # dip+mom+snap+trend = correlated long beta
 def can_open(st, leg):
     """True iff `leg` may take a slot: total < 5, this strat < its cap, and (for the long strats) dip+mom+snap+trend < ruin cap."""
@@ -636,6 +661,8 @@ def can_open(st, leg):
         if n_long_total(st) >= M_TOTAL_LONG_CAP: return False     # 🔒 ruin guard (trend = long beta)
     elif leg == "short":                                        # FADE
         if len(st["short"]) >= S_FADE_CAP: return False
+    elif leg == "squeeze":                                      # GREENER E5 SQUEEZE-FADE (short — no long ruin guard)
+        if len(st.get("squeeze", [])) >= SQF_CAP: return False
     return True
 def took_slot(st, leg):
     st["slot_turn"] = leg   # legacy field (kept for status/back-compat); allocation no longer uses a fair-share turn
@@ -738,6 +765,26 @@ def liq_flush(sym):
         if isinstance(d, list) and d:
             return sum(h.get("l", 0) for h in d[0].get("history", []))
         return 0.0
+    except Exception:
+        return None
+
+_LIQ30_CACHE = {}
+def liq30(sym):
+    """GREENER S1 gate data: trailing-30min LONG-liquidation USD (Coinalyze), cached 55s per symbol (rate-limit safety:
+    the PENDING re-check polls once a minute per pending coin, and pendings are capped by the slot pool). Returns the
+    summed $ or None on ANY failure/no key (caller decides fail-CLOSED)."""
+    hit = _LIQ30_CACHE.get(sym)
+    if hit and now() - hit[0] < 55: return hit[1]
+    if not COINALYZE_KEY: return None
+    try:
+        to = int(now()); frm = to - 30*60
+        u = (f"https://api.coinalyze.net/v1/liquidation-history?symbols={sym}_PERP.A&interval=1min"
+             f"&from={frm}&to={to}&convert_to_usd=true")
+        req = urllib.request.Request(u, headers={"api_key": COINALYZE_KEY})
+        d = json.loads(urllib.request.urlopen(req, timeout=4).read())
+        v = sum(float(h.get("l", 0) or 0) for h in d[0].get("history", [])) if (isinstance(d, list) and d) else 0.0
+        _LIQ30_CACHE[sym] = (now(), v)
+        return v
     except Exception:
         return None
 
@@ -855,6 +902,8 @@ def manage_snapback(st):
                 held = live_positions()
                 amt = held.get((sym, "LONG" if HEDGE else "BOTH"), 0.0) if isinstance(held, dict) else 0.0
                 if amt > 0:
+                    if pos.get("oid"): cancel(sym, pos["oid"])   # ORPHAN-FIX (GREENER): kill any unfilled remainder of the entry limit NOW (race-safe: errors harmlessly if fully filled)
+                    pos["qty"] = amt                             # size the position at what the EXCHANGE says we hold, not the arm qty
                     pos["state"] = "OPEN"; pos["fill_ts"] = now(); stop_market_sell(sym, round_tick(pos["stop"], specs(sym)))
                     log(f"A-FILL {sym} @ {fmt(pos['entry'])} [SNAP OPEN]")
                     _tg(f"🟢🔔 <b>A-FILL {sym}</b> @ {fmt(pos['entry'])} | tp +{SNAP_TP*100:.1f}% | stop {fmt(pos['stop'])}")
@@ -885,6 +934,121 @@ def _close_snap(st, pos, px, tag):
     book(st, "snap", pos, px, tag)
     try: st["snap"].remove(pos)
     except ValueError: pass
+
+# ========================= GREENER E5 SQUEEZE-FADE (ported from clever-bot 21-07) =========================
+# Taker market SELL into a SHORT-liq flush spike; exit = TIME (SQF_HOLD_MIN) or the WIDE catastrophe stop (+SQF_SL).
+# NO TP / NO trail. Port deltas vs clever-bot: U1/ledger/allocator stripped; PUMP CHECK FIRST (free klines) so the
+# Coinalyze call runs only for already-pumping coins (rate-limit: ~0-10 liq calls/min vs a 150-coin sweep's 429s).
+_SQ_COOLDOWN = {}
+def squeeze_liq(sym):
+    """(S5, S15, L15) = short-liq $ summed over last 5/15 min + long-liq over 15, Coinalyze 1min bars.
+    None on ANY failure/no key -> the engine SELF-IDLES (absence of data here IS 'no signal')."""
+    if not COINALYZE_KEY: return None
+    try:
+        to = int(now()); frm = to - 16*60
+        u = (f"https://api.coinalyze.net/v1/liquidation-history?symbols={sym}_PERP.A&interval=1min"
+             f"&from={frm}&to={to}&convert_to_usd=true")
+        req = urllib.request.Request(u, headers={"api_key": COINALYZE_KEY})
+        d = json.loads(urllib.request.urlopen(req, timeout=4).read())
+        if not (isinstance(d, list) and d): return None
+        hist = d[0].get("history", [])
+        if not hist: return (0.0, 0.0, 0.0)
+        s = [float(h.get("s", 0) or 0) for h in hist]; l = [float(h.get("l", 0) or 0) for h in hist]
+        return (sum(s[-5:]), sum(s[-15:]), sum(l[-15:]))
+    except Exception:
+        return None
+
+def pump15(sym):
+    """Pct change over the prior 15 CLOSED 1m bars. None on failure. (Forming bar dropped — closed candles only.)"""
+    k = mkl(sym, "1m", 18)
+    if not k or len(k) < 17: return None
+    k = k[:-1]
+    c = [float(x[4]) for x in k]
+    return (c[-1] / c[-16] - 1) * 100
+
+def squeeze_signal(sym):
+    """E5 trigger: pm15 >= SQF_PUMP_MIN (checked FIRST, free) AND S5 >= SQF_S5_MIN AND S15 > SQF_DOM * L15."""
+    pm = pump15(sym)
+    if pm is None or pm < SQF_PUMP_MIN: return None
+    ls = squeeze_liq(sym)
+    if ls is None: return None
+    S5, S15, L15 = ls
+    if S5 < SQF_S5_MIN: return None
+    if not (S15 > SQF_DOM * L15): return None
+    px = price_now(sym)
+    if px is None: return None
+    return {"px": px, "S5": S5, "S15": S15, "L15": L15, "pm15": pm}
+
+_LAST_SQ_BAR = [-1]
+def open_squeeze(st, watch):
+    """E5 arm: scan the liquid universe once per new 1m bar. Taker market SELL. Respects the short-side pauses
+    (streak + book-breaker) — a squeeze SL feeds the same counters in book()."""
+    if not SQF_ENABLED or not can_open(st, "squeeze"): return
+    if S_LOSS_STREAK_N > 0 and now() < st.get("fade_paused_until", 0): return       # short-side streak pause
+    if S_BOOK_BREAKER_N > 0 and now() < st.get("book_paused_until", 0): return      # short-side book-wide pause
+    cur_bar = int(now() // 60)
+    if cur_bar == _LAST_SQ_BAR[0]: return
+    _LAST_SQ_BAR[0] = cur_bar
+    open_syms = held_all(st)
+    margin = (st["equity"] / TOTAL_SLOTS) if st["equity"] else 0
+    for sym in watch:
+        if not can_open(st, "squeeze"): break
+        if sym in open_syms: continue
+        if now() - _SQ_COOLDOWN.get(sym, 0) < SQF_COOLDOWN_MIN * 60: continue
+        if S_COIN_COOLDOWN_SEC > 0:                                                  # respect the per-coin fade-stop cooldown too
+            last_sl = st.get("fade_sl_ts", {}).get(sym, 0)
+            if last_sl and now() - last_sl < S_COIN_COOLDOWN_SEC: continue
+        sig = squeeze_signal(sym)
+        if not sig: continue
+        entry = sig["px"]; sp = specs(sym)
+        if not sp: continue
+        qty, sp = calc_qty(sym, entry, margin * LEV * E_SIZE_FRAC)
+        if not qty: continue
+        log(f"SQF-ARM {sym}: squeeze SELL {qty} @ {fmt(entry)} S5 ${sig['S5']:,.0f} S15/L15 ${sig['S15']:,.0f}/${sig['L15']:,.0f} pump{sig['pm15']:+.1f}%")
+        if LIVE:
+            set_lev(sym); r = market_short(sym, qty)
+            if not (isinstance(r, dict) and not r.get("_error") and (r.get("orderId") or float(r.get("executedQty", 0) or 0) > 0)):
+                log(f"SQF-REJECT {sym}: {str(r)[:90]}"); continue
+            fill = float(r.get("avgPrice") or 0) if isinstance(r, dict) else 0
+            if fill > 0: entry = fill
+        sl_px = round_tick(entry * (1 + SQF_SL), sp)
+        sl_oid = None
+        if LIVE:
+            r2 = stop_market_buy(sym, sl_px)
+            sl_oid = r2.get("algoId") if isinstance(r2, dict) and not r2.get("_error") else None
+        st["squeeze"].append({"coin": sym, "state": "OPEN", "entry": entry, "qty": qty, "stop": sl_px, "sl_oid": sl_oid,
+                              "ts": now(), "fill_ts": now(), "maxadv": entry})
+        open_syms.add(sym); _SQ_COOLDOWN[sym] = now(); took_slot(st, "squeeze")
+        log(f"SQF-FILL {sym} @ {fmt(entry)} SL {fmt(sl_px)} (+{SQF_SL*100:.0f}%) hold {SQF_HOLD_MIN}m [SQUEEZE OPEN] | "
+            f"{n_open(st)}/{TOTAL_SLOTS} (L{len(st['long'])}/S{len(st['short'])}/SQ{len(st['squeeze'])})")
+        _tg(f"🟣🔔 <b>SQF-FILL {sym}</b> squeeze SELL @ {fmt(entry)} | SL +{SQF_SL*100:.0f}% | hold {SQF_HOLD_MIN}m | S5 ${sig['S5']:,.0f} pump {sig['pm15']:+.1f}%")
+
+def manage_squeeze(st):
+    """E5 exits: TIME (SQF_HOLD_MIN) or the wide catastrophe stop. Live also detects a native-stop close."""
+    if not st.get("squeeze"): return
+    realpos = live_positions() if LIVE else {}
+    if realpos is None: return
+    for pos in list(st["squeeze"]):
+        sym = pos["coin"]; px = price_now(sym)
+        if px is None: continue
+        pos["maxadv"] = max(pos.get("maxadv", pos["entry"]), px)
+        tag = None
+        if px >= pos["stop"]: tag = "SL"
+        elif now() - pos["fill_ts"] >= SQF_HOLD_MIN * 60: tag = "TIME"
+        if LIVE and tag is None and abs(realpos.get((sym, "SHORT"), 0.0)) < pos["qty"] * 0.5:
+            tag = "SL"                                       # native stop covered us on the exchange
+        if not tag: continue
+        exit_px = px
+        if LIVE:
+            if pos.get("sl_oid"): cancel_algo(sym, pos["sl_oid"])
+            if abs(realpos.get((sym, "SHORT"), 0.0)) >= pos["qty"] * 0.5: mkt_buy_close(sym, pos["qty"])
+            real = real_close_fill(sym, "BUY", pos.get("ts", now()))
+            if real: exit_px = real
+        exit_tel(sym, "short", tag, pos, px, (exit_px if LIVE else None))
+        book(st, "squeeze", pos, exit_px, tag)
+        try: st["squeeze"].remove(pos)
+        except ValueError: pass
+        log(f"SQF-CLOSE {sym} @ {fmt(exit_px)} ({tag})")
 
 # ========================= TREND LEG (D) — daily Donchian breakout + regime + scale-out (validated +202%/5 windows) =========================
 # Our strongest VALIDATED directional edge (trend_multi_backtest config D: 30/15 daily channel + SMA100, +202% / avgDD 19%
@@ -1314,7 +1478,7 @@ def open_short(st, watch):
             log(f"S-BOOK-PAUSE — {recent} fade stops in {int(S_BOOK_WINDOW_SEC/60)}m (book-wide squeeze guard), all fades paused {int((st['book_paused_until']-now())/60)}m | {n_open(st)}/{TOTAL_SLOTS}")
             st["book_pause_logged"] = st["book_paused_until"]
         return
-    have = held_short(st); fires = []
+    have = held_all(st); fires = []                            # GREENER: cross-leg same-coin exclusion (was held_short only)
     for sym in watch:
         for tf, bpd in S_SCAN_TFS:
             fire, cts, lvl, stop, pump, c7 = short_signal(sym, tf, bpd)
@@ -1340,6 +1504,12 @@ def open_short(st, watch):
         if st["last_sig"].get(sym) == cts: continue
         if not lvl or stop <= lvl: continue
         if not short_liq_ok(sym): continue                     # SHORT-LIQ CATALYST GATE (only fade when trapped LONGS liquidate)
+        if GR_FILL_LIQ_MIN > 0:                                # GREENER S1: liq-at-fill gate, ARM side. FAIL-CLOSED on missing data.
+            v = liq30(sym)
+            if v is None:
+                log(f"S-LIQGATE {sym}: liq data unavailable — FAIL-CLOSED, no arm"); continue
+            if v < GR_FILL_LIQ_MIN:
+                continue                                       # catalyst not alive -> don't even rest the limit
         if S_SL_FIXED > 0: stop = lvl*(1 + S_SL_FIXED)         # fixed-% fade stop (Artem 14-07): override the structural failed-pump high
         risk = (stop - lvl)/lvl                                 # stop distance = (failed-pump high - entry)/entry
         notional = short_notional(st["equity"], risk, funding_mult(sym, "short"))   # HYBRID sizing + B: boost scales equal-slot BEFORE the risk cap
@@ -1402,6 +1572,13 @@ def manage_short(st):
     for pos in list(st["short"]):
         sym = pos["coin"]; px = price_now(sym)
         if pos["state"] == "PENDING":
+            if GR_FILL_LIQ_MIN > 0:                            # GREENER S1: the resting limit may only live while the catalyst is alive
+                v = liq30(sym)                                 # (cached 55s -> ~1 API call/min per pending coin)
+                if v is not None and v < GR_FILL_LIQ_MIN:
+                    if LIVE and pos.get("oid"): cancel(sym, pos["oid"])
+                    st["short"].remove(pos)
+                    log(f"S-LIQDROP {sym}: liq30 ${v:,.0f} < ${GR_FILL_LIQ_MIN:,.0f} — catalyst died, retest cancelled | {n_open(st)}/{TOTAL_SLOTS}")
+                    continue
             filled = False; entry = pos["entry"]
             if LIVE:
                 stt = order_status(sym, pos["oid"]); s = stt.get("status") if isinstance(stt, dict) else None
@@ -1812,9 +1989,9 @@ def manage_momentum(st):
 # ========================= BOOK =========================
 def book(st, leg, pos, exit_px, tag, count_wl=True):
     entry = pos["entry"] or pos.get("limit")
-    is_taker_entry = (leg == "trend")                    # D#7: trend enters IOC (taker); other legs enter maker
+    is_taker_entry = (leg in ("trend", "squeeze"))       # D#7: trend enters IOC; GREENER E5 squeeze enters taker market
     fee = (FEE_TK if is_taker_entry else FEE_MK) + (FEE_MK if tag == "TP" else FEE_TK)
-    if leg == "short": ret = (entry-exit_px)/entry*100 - fee
+    if leg in ("short", "squeeze"): ret = (entry-exit_px)/entry*100 - fee   # both are SHORT-direction
     else: ret = (exit_px-entry)/entry*100 - fee          # LONG and MOM are both long-direction
     pnl = (entry*pos["qty"])*ret/100
     st["realized"] += pnl
@@ -1825,7 +2002,7 @@ def book(st, leg, pos, exit_px, tag, count_wl=True):
         else:
             st["loss_streak"] = st.get("loss_streak", 0) + 1
             if st["loss_streak"] >= L_LOSS_STREAK_N: st["paused_until"] = now() + L_COOLDOWN_SEC
-    elif leg == "short":   # FADE-QUALITY (15-07): FIX3 fade loss-streak breaker + FIX4 per-coin SL cooldown (both env-gated, inert unless enabled)
+    elif leg in ("short", "squeeze"):   # FADE-QUALITY (15-07): FIX3 loss-streak breaker + FIX4 per-coin SL cooldown. GREENER: squeeze stops feed the SAME short-side counters (side-aware breaker — a squeeze SL is a short-side stop; the pause blocks BOTH fade and squeeze arming). BE-tighten stays fade-only by design (a squeeze's thesis IS holding through the wiggle).
         if tag == "SL" and ret < 0:   # ONLY a REAL negative-PnL auto-stop counts (wins/trails/manual mislabels excluded)
             st["fade_sl_ts"] = st.get("fade_sl_ts", {}); st["fade_sl_ts"][pos["coin"]] = now()   # FIX4: remember this coin just stopped out
             st["fade_streak"] = st.get("fade_streak", 0) + 1                                      # FIX3: consecutive-stop counter
@@ -1903,8 +2080,10 @@ def main():
     bband = f"FUND-B=snap<{B_FUND_LO}/fade>{B_FUND_HI} x{B_FUND_BOOST}" if (B_FUND_LO or B_FUND_HI) else "FUND-B=OFF"
     dband = (f"TREND=D:donchian{T_DON_N}/{T_TRAIL_N} SMA{T_SMA} ATR{T_ATR_K}x{' scale-out' if T_SCALE else ''} cap{T_CAP}{' BTC-regime' if T_BTC_REGIME else ''}" if T_ENABLED else "TREND=OFF")
     eband = f"E={'pyramid+' if S_PYRAMID else ''}Kelly{E_SIZE_FRAC}" + (f" (fade +{S_PYR_R}R x{S_PYR_FRAC}->BE)" if S_PYRAMID else "")
-    log(f"GLADIATOR BOT ({'🔴 LIVE' if LIVE else '📝 PAPER'}) start — eq ${st['equity']:.2f} | {TOTAL_SLOTS} slots "
-        f"(dip≤{M_DIP_CAP}/fade≤{S_FADE_CAP}/mom≤{M_MOM_CAP}/snap≤{SNAP_CAP}, 🔒total-long≤{M_TOTAL_LONG_CAP}) {LEV}x | "
+    log(f"GREENER BOT ({'🔴 LIVE' if LIVE else '📝 PAPER'}) start — eq ${st['equity']:.2f} | {TOTAL_SLOTS} slots "
+        f"(dip≤{M_DIP_CAP}/fade≤{S_FADE_CAP}/sqf≤{SQF_CAP}/mom≤{M_MOM_CAP}/snap≤{SNAP_CAP}, 🔒total-long≤{M_TOTAL_LONG_CAP}) {LEV}x | "
+        f"{'S1-LIQGATE@fill≥$'+format(GR_FILL_LIQ_MIN,',.0f') if GR_FILL_LIQ_MIN else 'S1-liqgate OFF'} | "
+        f"{'E5-SQF ON (S5≥$'+format(SQF_S5_MIN,',.0f')+' hold'+str(SQF_HOLD_MIN)+'m SL+'+format(SQF_SL*100,'.0f')+'%)' if SQF_ENABLED else 'E5-SQF off'} | "
         f"DIP=maker dip-buy (TP+{L_TP}% trail@{L_TRAIL_ACT*100:.1f}%/{L_TRAIL*100:.1f}%{' OI-HARD' if L_OI_CAPIT else (f' OI-SOFT{L_OI_CAPIT_SOFT}' if L_OI_CAPIT_SOFT else '')}) | "
         f"FADE={stfs} (R{S_R} {f'CHANDELIER{S_CHAND_K}xATR@{S_CHAND_ARM*100:.0f}%' if S_CHAND else f'trail@{S_TRAIL_ACT*100:.0f}%/{S_TRAIL*100:.1f}%'}{f' liq-gate≥${S_LIQ_MIN:.0f}' if S_LIQ_MIN else ''}) | {mband} | {aband} | {bband} | {dband} | {eband} | hedge={HEDGE}")
     reconcile_orders(st)        # cancel orphan/duplicate exchange orders left by a mid-arm restart (prevents phantom-slot bug)
@@ -1917,7 +2096,7 @@ def main():
                 if bal: st["equity"] = bal
             d = time.strftime("%Y-%m-%d", time.gmtime())
             if st.get("day") != d: st["day"] = d; st["day_eq"] = st.get("equity", 0.0) or 0.0   # new UTC day -> reset the daily-loss anchor
-            manage_long(st); manage_short(st); manage_momentum(st); manage_snapback(st); manage_trend(st)
+            manage_long(st); manage_short(st); manage_momentum(st); manage_snapback(st); manage_trend(st); manage_squeeze(st)
             if now()-last_watch > REFRESH_SEC:
                 watch = build_watchlist()
                 open_long(st, watch); open_short(st, watch)
@@ -1925,10 +2104,12 @@ def main():
             open_momentum(st)   # self-guards: heavy movers scan runs once per new 15m bar; cheap no-op otherwise
             open_snapback(st)   # A: liq-snapback longs (self-guards: leg off / no slot / BTC distribution)
             open_trend(st)      # D: daily Donchian trend longs (self-guards: leg off / no slot / once-per-day / risk-off)
+            open_squeeze(st, watch)   # GREENER E5: squeeze-fade shorts (self-guards: off / no slot / 1m-bar throttle / short-side pauses)
             regime = "risk-ON" if btc_risk_on() else "risk-OFF"
             open(STATUS_FILE, "w").write(
                 f"{ts()} | {'LIVE' if LIVE else 'PAPER'} | BTC(info)={regime} | Lqual={st.get('lbreadth','?')} Sfires={st.get('sfires','?')} | "
                 f"L={[(p['coin'],p['state']) for p in st['long']]} S={[(p['coin'],p['state']) for p in st['short']]} "
+                f"SQ={[(p['coin'],p['state']) for p in st.get('squeeze',[])]} "
                 f"M={[(p['coin'],p['setup'],p['state']) for p in st.get('mom',[])]} "
                 f"eq=${st['equity']:.2f} {st['wins']}W/{st['losses']}L realized=${st['realized']:+.2f}")
             save_state(st)
