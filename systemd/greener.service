@@ -1,0 +1,13 @@
+[Unit]
+Description=Greener bot (LIVE) — 2L/2S: liq-gated fade + E5 squeeze-fade shorts, snap + dip longs
+After=network-online.target
+[Service]
+Type=simple
+WorkingDirectory=/root/greener
+Environment=COMBO_DATA_DIR=/root/greener/data
+Environment=COINALYZE_KEY=__SET_ON_DEPLOY__
+ExecStart=/usr/bin/python3 -u /root/greener/greener_bot.py --live
+Restart=always
+RestartSec=10
+[Install]
+WantedBy=multi-user.target
