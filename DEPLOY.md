@@ -1,206 +1,90 @@
-# GLADIATOR BOT — COMPLETE RECOVERY & OPERATING MANUAL
+# GREENER BOT — COMPLETE RECOVERY & OPERATING MANUAL
 ### For Artem, and for any AI model asked to work on this bot. Read top to bottom BEFORE touching anything.
-*(Master copy lives in the repo; the ZIP build copies it in. The ZIP additionally contains `secrets/` + `systemd/` pulled from the live VPS.)*
+*(Master copy in the repo. The ZIP build adds `secrets/` with live keys pulled from the VPS.)*
 
 ---
 
 ## 🔴🔴 STOP — READ FIRST
 
-### 1. The ZIP build of this archive contains LIVE TRADING KEYS to a REAL-MONEY Binance Futures account.
-`secrets/binance.env` holds `BINANCE_KEY` / `BINANCE_SECRET`. `systemd/gladiator.service` holds `COINALYZE_KEY`.
-**Anyone with these can trade this account.**
-
-> **⚠️ BEFORE giving the ZIP to ANY AI model, chat, cloud, or person: DELETE the `secrets/` folder and
-> redact `COINALYZE_KEY` from `systemd/gladiator.service`.** The bot deploys fine without them — paste them
-> back at deploy time (§5). Pasting keys into an AI chat puts them in that vendor's logs forever.
-
-### 2. NEVER deploy, commit, push, scp, or restart anything without Artem's explicit «так».
-Standing, non-negotiable rule. Propose → wait for «так» → act. Every step gated, every step reversible.
-
-### 3. This is REAL MONEY (~$74). Not paper.
+1. **The ZIP build contains LIVE TRADING KEYS** (`secrets/binance.env`; `systemd/greener.service` carries
+   `COINALYZE_KEY` when built from the VPS). **Delete `secrets/` + redact the key before sharing with ANY AI/person.**
+2. **NEVER deploy/commit/push/scp/restart without Artem's explicit «так».** Propose → wait → act.
+3. **REAL MONEY** (~$74, Binance USDT-M, 3x). Greener and Gladiator share ONE account — **never run both**
+   (pause one before starting the other: `systemctl disable --now gladiator` ⟷ `... greener`).
 
 ---
 
-## 1. WHAT THIS BOT IS
+## 1. WHAT GREENER IS
 
-`gladiator_bot.py` — event-driven crypto futures bot on Binance USDⓈ-M perpetuals. **5 legs**, each env-gated:
+A 2-LONG / 2-SHORT, 4-slot evolution of Gladiator (it IS the live gladiator codebase + three additions),
+born 21-07-2026 from the WR70 research program:
 
-| leg | what it does | live status |
-|---|---|---|
-| **FADE** (short) | shorts a *busted breakout*: coin breaks a 20-bar high, the breakout FAILS (closes back under), we rest a maker sell limit AT that level and short the retest, betting the level rejects it again | ✅ **THE ONLY LIVE LEG** |
-| DIP (long) | maker dip-buy −1.2% w/ strength gates | OFF (`M_DIP_CAP=0`) |
-| SNAP (long) | liquidation-snapback V-reclaim buy | OFF (`SNAP_CAP=0`) |
-| MOMENTUM (long) | breakout/ignition/retest on top-RS movers | OFF — structurally broken, §8 |
-| TREND (long) | daily Donchian, BTC>200d gated | OFF (idle in bear) |
+| slot | engine | thesis | evidence |
+|---|---|---|---|
+| S1 | **FADE + liq-at-fill gate** | short a busted pump, but ONLY while trapped longs are actively liquidating (trailing-30min long-liq ≥ $1k at/into the fill) + **TP 0.5% / SL 1.5%** | WR70 study candidate #1: **84.4% WR, +0.136%/tr** after fees+measured slippage, n=64, survived in-era OOS/concentration/jackknife. Grade B — forward-validating live |
+| S2 | **E5 SQUEEZE-FADE** (from clever-bot) | taker sell into a SHORT-liq flush spike; exit = TIME 60m or +4% catastrophe stop; NO TP/trail | 4/4 OOS windows, +0.297%/tr on the long tape; **WR ~48% BY DESIGN** — judge on expectancy, not WR |
+| L1 | **SNAP** (liq-snapback) | buy the V-reclaim after a long-liq flush ≥$400k on liquid top-40 | PF 1.56 one window; the tape that stops the fades FILLS the snaps = squeeze hedge |
+| L2 | **DIP** (ballast) | maker −1.2% dip-buy behind the full gate stack, tight trail | ~breakeven engine; exists to flatten book beta, not to earn |
 
-**Current mode = FADE-ONLY, 4 short slots** (20-07: Artem's conscious choice; fewer slots = +25% per-trade sizing).
+Book beta ≈ 0 by construction (2S+2L). Trend leg (BTC>200d Donchian) stays OFF until the regime turns.
 
-### The fade thesis in one line
-A coin pumps → the pump fails → we sell into the retest of the failed level → it rejects again → we take +0.5%.
+### Key mechanics added vs Gladiator (all env-gated, defaults inert)
+- `GR_FILL_LIQ_MIN` — S1 arm requires liq30 ≥ floor (**FAIL-CLOSED** on missing data); a PENDING retest is
+  **cancelled the minute the catalyst dies** (`S-LIQDROP`) → fills only happen while the catalyst is alive.
+- `SQF_*` — E5 engine; pump-check runs FIRST so Coinalyze sees ~0-10 calls/min (free tier ~40/min).
+- Squeeze SLs feed the **short-side breaker** (streak + book-wide + BE-tighten pauses block BOTH short engines).
+- **Cross-leg same-coin exclusion** (`held_all`) — one symbol lives in ONE leg at a time.
+- Snap **orphan-fix** (cancel entry remainder on fill, qty from exchange amt) — the 20-07 incident class is dead
+  in fade/dip/snap; momentum stays off (own unfixed bugs).
 
----
-
-## 2. CURRENT LIVE STATE (as of 20-07-2026 evening)
-
+## 2. CURRENT LIVE STATE — see the repo/HANDOVER for the running values
 ```
-host        root@167.233.55.14   (Hetzner VPS)
-service     systemd unit `gladiator`   workdir /root/gladiator
-equity      ~$74 USDT
-code md5    2fd3af2354803a95434e8c668c080419
-GitHub      https://github.com/artemmeleshko-trainar/Gladiator   (main, commit 3b40807)
-tests       174/174 passing
-era         4-slot era since 20-07 09:37 (counter reset then; ORPHAN-FIX restart 17:50 kept state)
+host      root@167.233.55.14 · systemd unit `greener` · workdir /root/greener
+GitHub    https://github.com/artemmeleshko-trainar/Greener
+tests     188/188 (run: COMBO_DATA_DIR=/tmp/t python3 test_greener_bot.py)
+config    systemd/greener.conf (THE config — 4 slots, caps 1/1/1/1, TP0.5/SL1.5, GR_FILL_LIQ_MIN=1000)
 ```
 
-### The exact live fade config (systemd drop-in `fadeonly.conf`)
-```
-slots   4 (TOTAL_SLOTS=4 + S_FADE_CAP=4)  ← TOTAL_SLOTS is ALSO the sizing divisor
-size    margin = equity/4 × 3x ≈ $55 notional per fade (+25% vs the 5-slot era)
-entry   maker limit sell at the failed level (GTC, above market)   → MAKER
-TP      -0.5%  (S_TP_FIXED=0.005)  post-only maker limit buy        → MAKER
-SL      +0.5%  (S_SL_FIXED=0.005)  native STOP_MARKET               → TAKER (unavoidable)
-filter  0 <= c7d <= 50 (S_COIN7D_MIN=0 / S_COIN7D_CAP=50) · pump ≤2.5% (S_PUMP_MAX)
-        per-coin re-fade cooldown 2h · 3 consecutive stops → 1h pause (S_LOSS_STREAK_N=3)
-        2 stops/45min → pause ALL fades 1h (S_BOOK_BREAKER_N=2/S_BOOK_WINDOW_SEC=2700)
-        + on that trip de-risk OPEN fades to breakeven (S_BOOK_BE_TIGHTEN=1)
-scan    1h + 15m (S_SCAN_TFS)
-```
-**⚠️ 4 slots is a LEVERAGE choice, not an edge improvement** (2 agent studies, 192 fills: the 5th slot never
-hosted an era fill → same trades, +25% size, +25% drawdown).
-
----
-
-## 3. ZIP MANIFEST
-
-```
-gladiator-bot/
-├── DEPLOY.md                  ← this manual
-├── gladiator_bot.py           ← the bot (md5 §2 = exact live copy)
-├── super_scanner.py           ← Binance REST helpers. Required.
-├── test_gladiator_bot.py      ← 174 tests. Run before ANY deploy.
-├── secrets/binance.env        ← 🔴 LIVE KEYS (ZIP only). DELETE BEFORE SHARING.
-└── systemd/  gladiator.service (🔴 has COINALYZE_KEY) · fadeonly.conf (THE config) · caps/snap/trail.conf (legacy)
-```
-**Dependencies: NONE beyond Python 3 stdlib.** (VPS runs Python 3.14.)
-
----
-
-## 4. DEPLOY FROM ZERO (new server)
-
+## 3. DEPLOY FROM ZERO
 ```bash
-ssh root@<NEW_SERVER>
-mkdir -p /root/gladiator/data/logs /root/v2bot/data/secrets
-scp gladiator-bot/{gladiator_bot.py,super_scanner.py,test_gladiator_bot.py} root@<NEW_SERVER>:/root/gladiator/
-scp gladiator-bot/secrets/binance.env root@<NEW_SERVER>:/root/v2bot/data/secrets/binance.env
-ssh root@<NEW_SERVER> 'chmod 600 /root/v2bot/data/secrets/binance.env'
-scp gladiator-bot/systemd/gladiator.service root@<NEW_SERVER>:/etc/systemd/system/
-ssh root@<NEW_SERVER> 'mkdir -p /etc/systemd/system/gladiator.service.d'
-scp gladiator-bot/systemd/*.conf root@<NEW_SERVER>:/etc/systemd/system/gladiator.service.d/
-# TESTS FIRST — must print "174 passed, 0 failed":
-ssh root@<NEW_SERVER> 'cd /root/gladiator && COMBO_DATA_DIR=/tmp/t python3 test_gladiator_bot.py | tail -1'
-ssh root@<NEW_SERVER> 'systemctl daemon-reload && systemctl enable --now gladiator'
-# VERIFY: is-active=active · banner says "4 slots (…fade≤4…)" · heartbeat timestamp ADVANCES · md5 matches §2
+ssh root@<SERVER>; mkdir -p /root/greener/data/logs /root/v2bot/data/secrets
+scp greener-bot/{greener_bot.py,super_scanner.py,test_greener_bot.py} root@<SERVER>:/root/greener/
+scp gladiator-bot/secrets/binance.env root@<SERVER>:/root/v2bot/data/secrets/   # same account keys
+scp greener-bot/systemd/greener.service root@<SERVER>:/etc/systemd/system/      # set COINALYZE_KEY inside!
+mkdir /etc/systemd/system/greener.service.d && scp greener-bot/systemd/greener.conf root@<SERVER>:/etc/systemd/system/greener.service.d/
+ssh root@<SERVER> 'cd /root/greener && COMBO_DATA_DIR=/tmp/t python3 test_greener_bot.py | tail -1'  # MUST be 188 passed
+ssh root@<SERVER> 'systemctl disable --now gladiator'        # ONE account — pause the other bot FIRST
+ssh root@<SERVER> 'systemctl daemon-reload && systemctl enable --now greener'
+# VERIFY: active · banner "GREENER BOT … 4 slots … S1-LIQGATE@fill≥$1,000 … E5-SQF ON" · heartbeat advances ·
+#         positionRisk vs state = no orphans · md5 matches the repo
 ```
-**⚠️ Binance keys are IP-whitelisted → add the new server's IP in Binance API settings or all signed calls -2015.**
+Keys live at `/root/v2bot/data/secrets/binance.env` (legacy path). Binance keys are IP-whitelisted.
 
----
+## 4. ECONOMICS & DISCIPLINE (inherited — the short version)
+- Fees: maker 0.018% / taker 0.045% (BNB ON — **keep BNB topped up**, it runs out in days and fees hide there).
+  S1 winner RT 0.036%; E5 RT 0.09% (taker both ways) — E5's edge budget already includes it.
+- **S1's SL 1.5% is wide**: one stop ≈ 3 wins. The gate's job is to make stops rare (studied 84% WR). If live
+  WR falls toward its 78% breakeven → the candidate failed forward validation; revert to the old exits
+  (`S_SL_FIXED=0.005`, `GR_FILL_LIQ_MIN=0`) and say so plainly.
+- All Gladiator discipline applies: «так» before any deploy · ≥4-window validation · audit-before-numbers ·
+  "beautifully conclusive = bug" · state ≠ truth for positions (cross-check positionRisk) · WR alone is NOT the
+  objective — expectancy is.
 
-## 5. SECRETS
-
-`secrets/binance.env` → `/root/v2bot/data/secrets/binance.env` (legacy path, NOT /root/gladiator/):
-`BINANCE_KEY=` / `BINANCE_SECRET=`.
-Fresh keys: Binance → API Management → ✅ Enable Futures · ❌ NO Withdrawals · ✅ IP-restrict. Keep the **BNB
-fee discount ON** (the economics assume it). `COINALYZE_KEY` (in gladiator.service) = liquidation API, currently
-inert (`S_LIQ_MIN=0`); free key at coinalyze.net or drop the line.
-
----
-
-## 6. THE ECONOMICS — read before "improving" anything
-
-maker 0.020%→**0.018%** w/BNB (entry+TP) · taker 0.050%→**0.045%** (SL only) · winner RT ~0.036% ≈ **7% of a
-+0.5% win** · funding ≈ $0 (fades last minutes, never span 8h stamps).
-- **Fees are PROPORTIONAL** — capital does NOT reduce the drag (only VIP ~$15M/mo would; we do ~$78k).
-- **Fees are paid in BNB** → invisible in USDT balance → **USDT equity OVERSTATES net. Keep BNB topped up.**
-- **TP 0.5% is settled:** +0.7%/+1.0% lose (move is ~0.5R); TP0.4 variants = indistinguishable-to-worse
-  (20-07, 192 fills, 2 agents). c7d ceiling 30 = REFUTED (in-sample artifact). Don't re-tune.
-
----
-
-## 7. THE DISCIPLINE (violating these has cost real money)
-
-1. **Never deploy without «так»**; every change env-gated + reversible + tests green ON the VPS first.
-2. **Validate ≥4 windows + max-DD.** 3. **"Beautifully conclusive" = red flag for a bug.**
-4. **Audit sims adversarially BEFORE reading the number** (two false verdicts on 17-07 were the analyst's own bugs).
-5. **Backtest bugs are not sign-neutral** (look-ahead/censoring flatter). 6. **"Refuted" ≠ "measured."**
-7. **A hypothesis born from a sample cannot be confirmed by that sample.** 8. **Judge risk features by DRAWDOWN.**
-9. **The bot's state is NOT the source of truth for positions — the EXCHANGE is** (see ORPHAN incident, §8):
-   cross-check `positionRisk` against the state when anything looks odd.
-
-### Honest state of the edge
-Thin, NOT yet proven. Pre-reset era: 48W/33L, +$1.18/4d — positive, not statistically distinguishable from
-zero. Forward-collect to n≈400 (checkpoint agenda in `~/Desktop/TrainAR/grid-bot/HANDOVER.md`). **Do not call
-the bot proven profitable.**
-
----
-
-## 8. KNOWN BUGS / SETTLED QUESTIONS (do NOT re-litigate without new data)
-
-- **ORPHAN-FIX (20-07, FIXED in 3b40807):** a PARTIALLY_FILLED entry limit left its unfilled remainder resting;
-  after the tracked part closed, the remainder could fill later = an untracked position with NO TP/SL (live
-  incident: ONDO 92.8 + MET 314; Artem spotted −1% adverse with no stop and flattened by hand). Fix: on partial
-  fill, cancel the remainder immediately + race-safe re-query (fade + dip legs). Momentum break/ignite = IOC =
-  immune; momentum-retest + snap legs are OFF and still carry the old pattern — fix before ever enabling them.
-- **Momentum leg: never measured, structurally mute** (forming-bar bug + brk=ref instant-exit; all prior numbers
-  were proxy artifacts). Stays OFF.
-- **c7d ceiling 30: REFUTED** (quasi-OOS the 30-50 band was the BEST band). **TP0.4 variants: REFUTED.**
-- **Book-breaker FIX5: unresolvable on current data** — kept; can't see slow-drip clusters (~1 stop/hr). n≈400.
-- **Research tooling:** never FIFO-match ARM→FILL; never trust reconstructed slot occupancy without restart
-  force-cancels (use the log's printed `n/X`); banner "FADE R3.0 trail@…" text is stale cosmetics.
-
----
-
-## 9. ROLLBACK CHEAT-SHEET
-
-Edit `/etc/systemd/system/gladiator.service.d/fadeonly.conf` → `systemctl daemon-reload && systemctl restart gladiator`.
-
-| revert | set |
+## 5. ROLLBACKS
+| what | how |
 |---|---|
-| 5 slots (−25% sizing) | `TOTAL_SLOTS=5` + `S_FADE_CAP=5` |
-| c7d floor off / SL 0.9% | `S_COIN7D_MIN=-1e9` / `S_SL_FIXED=0.009` |
-| breaker / BE-tighten off | `S_BOOK_BREAKER_N=0` / `S_BOOK_BE_TIGHTEN=0` |
-| pre-fade-only everything | `rm fadeonly.conf` + daemon-reload + restart |
-| ORPHAN-FIX code rollback | VPS bak `gladiator_bot.py.bak-pre-orphanfix-*` (or any prior bak) |
+| Greener → Gladiator (full revert) | `systemctl disable --now greener && systemctl enable --now gladiator` |
+| S1 gate off (plain fade) | `GR_FILL_LIQ_MIN=0` in greener.conf → reload → restart |
+| S1 exits back to symmetric | `S_SL_FIXED=0.005` |
+| E5 off / snap off / dip off | `SQF_ENABLED=0` / `SNAP_CAP=0` / `M_DIP_CAP=0` |
 
-Full stop: `systemctl disable --now gladiator` (native TP/SL orders stay on the exchange; the trail stops being managed).
-
----
-
-## 10. USEFUL COMMANDS (run ON the VPS)
-
+## 6. COMMANDS (on the VPS)
 ```bash
-# stats one-liner
-python3 -c 'import json,time;d=json.load(open("/root/gladiator/data/combo_state.json"));n=time.time();w,l=d["wins"],d["losses"];t=w+l;fp,bp=d.get("fade_paused_until",0),d.get("book_paused_until",0);print("eq $%.2f | %dW/%dL WR %.0f%% | realized $%+.2f"%(d["equity"],w,l,100*w/t if t else 0,d["realized"]));print("open:",[(p["coin"],p["state"]) for p in d["short"]] or "none");print("pause: streak",int((fp-n)/60) if fp>n else 0,"m | book",int((bp-n)/60) if bp>n else 0,"m")'
-cat /root/gladiator/data/logs/combo_status.txt          # heartbeat — timestamp MUST advance
-journalctl -u gladiator -f -o cat | grep -E "S-ARM|S-FILL|SHORT-CLOSE|S-BOOK|S-STREAK"   # live feed
-# pause new entries only:  printf '[Service]\nEnvironment=S_FADE_CAP=0\n' > /etc/systemd/system/gladiator.service.d/pause.conf && systemctl daemon-reload && systemctl restart gladiator   (unpause: rm + reload + restart)
-# ORPHAN check (state vs exchange — do this whenever something looks odd): positions on the exchange not present in combo_state.json = orphans
+cat /root/greener/data/logs/combo_status.txt     # heartbeat (timestamp MUST advance); shows L/S/SQ/M + W/L
+journalctl -u greener -f -o cat | grep -E "S-ARM|S-FILL|SHORT-CLOSE|SQF|A-FILL|L-ARM|S-LIQDROP|S-BOOK"
+python3 -c 'import json;d=json.load(open("/root/greener/data/combo_state.json"));print(d["wins"],"W/",d["losses"],"L", round(d["realized"],2), [(p["coin"],p["state"]) for k in ("short","squeeze","snap","long") for p in d.get(k,[])])'
 ```
+Log decoder additions vs Gladiator: `SQF-ARM/FILL/CLOSE` = E5 · `S-LIQDROP` = catalyst died, retest cancelled ·
+`S-LIQGATE` = no liq data, fail-closed skip · `SQUEEZE-CLOSE (TIME …)` = E5 time exit.
 
-### Log decoder
-`S-ARM … | n/4 (L0/Sk)` limit placed (k = shorts incl PENDING) · `S-FILL` short open · `SHORT-CLOSE (TP +0.4%)`
-win · `(SL -0.5%)` real stop · `(SL +0.4%)` ⚠️ POSITIVE pct = mislabeled WIN · `S-RUNAWAY/S-EXPIRE` pending
-cancelled (~⅓ of arms, normal) · `S-BOOK-PAUSE/S-BOOK-BE` squeeze guard.
-
----
-
-## 11. WHERE EVERYTHING ELSE LIVES
-
-Canonical resume: `~/Desktop/TrainAR/grid-bot/HANDOVER.md` → `▶▶ CURRENT STATE` (**read before any work**) ·
-lessons `grid-bot/LESSONS.md` · repo `~/Desktop/TrainAR/gladiator-bot/` · GitHub
-https://github.com/artemmeleshko-trainar/Gladiator · studies `grid-bot/{breaker_window_study,mom_clean,checkpoint_study}/`.
-
-**The ZIP alone fully redeploys the bot** — stdlib-only .py files + §4 procedure.
-
----
-
-*Updated 20-07-2026 evening. md5 `2fd3af2354803a95434e8c668c080419` · GitHub `3b40807` · 174/174 tests · 4-slot era.*
+*Born 21-07-2026 from the WR70 research program (3 agents). Gladiator remains installed+paused as the fallback.*
