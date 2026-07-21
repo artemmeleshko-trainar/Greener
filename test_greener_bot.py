@@ -849,7 +849,8 @@ c.LIVE = True; c.live_positions = lambda: {}; c.price_now = lambda s: 0.35
 c.GR_FILL_LIQ_MIN = 1000.0
 _gcalls = {"cancel": []}
 c.cancel = lambda sym, oid: (_gcalls["cancel"].append((sym, oid)), {"orderId": oid})[1]
-c.order_status = lambda sym, oid: {"status": "NEW", "executedQty": "0"}
+c.order_status = lambda sym, oid: ({"status": "CANCELED", "executedQty": "0"} if _gcalls["cancel"]
+                                   else {"status": "NEW", "executedQty": "0"})   # post-cancel reality: CANCELED/0 (the BUG-1 fix re-queries)
 def _gpos():
     return {"coin": "LIQUSDT", "state": "PENDING", "oid": 7001, "entry": 0.35, "qty": 100.0, "stop": 0.3553,
             "tp": None, "tp_oid": None, "sl_oid": None, "ts": c.now(), "fill_deadline": c.now()+9999,
@@ -920,16 +921,23 @@ st_s = _sqst(squeeze=[{"coin": "TQ2", "state": "OPEN", "entry": 100.0, "qty": 1.
                         "ts": c.now(), "fill_ts": c.now(), "maxadv": 100.0}])
 c.manage_squeeze(st_s)
 ok(len(st_s["squeeze"]) == 0 and st_s["losses"] == 1, "catastrophe stop (+4%) closes and books the loss")
-# open_squeeze respects the short-side book pause
+# open_squeeze respects the short-side book pause (probe = pump15: the scan's first data touch)
 c.SQF_ENABLED = True
 _sq_probe = {"n": 0}
-c.squeeze_signal = lambda s: (_sq_probe.__setitem__("n", _sq_probe["n"] + 1), None)[1]
+_svp15 = c.pump15
+c.pump15 = lambda s: (_sq_probe.__setitem__("n", _sq_probe["n"] + 1), None)[1]
 st_p = _sqst(book_paused_until=c.now() + 999)
 c._LAST_SQ_BAR[0] = -1
 _svbbn = c.S_BOOK_BREAKER_N; c.S_BOOK_BREAKER_N = 2
 c.open_squeeze(st_p, ["AUSDT"])
 ok(_sq_probe["n"] == 0, "open_squeeze BLOCKED during the short-side book-wide pause (never scans)")
 c.S_BOOK_BREAKER_N = _svbbn
+# ...and WITHOUT the pause the scan DOES touch the universe (guards the probe against vacuity)
+st_np = _sqst()
+c._LAST_SQ_BAR[0] = -1
+c.open_squeeze(st_np, ["AUSDT"])
+ok(_sq_probe["n"] == 1, "no pause -> the scan runs (pump15 consulted; probe non-vacuous)")
+c.pump15 = _svp15
 c.SQF_ENABLED = _sve["sqe"]; c.SQF_CAP = _sve["cap"]; c.LIVE = _sve["live"]; c.price_now = _sve["pn"]
 c.live_positions = _sve["lp"]; c.real_close_fill = _sve["rc"]; c.cancel_algo = _sve["cg"]; c.mkt_buy_close = _sve["mb"]
 
@@ -951,6 +959,91 @@ ok("SNPUSDT" in c.held_all(_sqst(snap=[{"coin": "SNPUSDT"}])) and "SNPUSDT" in c
    "held_all sees coins across ALL legs (cross-leg same-coin exclusion input)")
 c.LIVE = _svs["live"]; c.live_positions = _svs["lp"]; c.cancel = _svs["ca"]; c.stop_market_sell = _svs["sm"]
 c.specs = _svs["sp"]; c.price_now = _svs["pn"]
+
+print("\n=== GREENER AUDIT FIXES: the money-losing races the auditor found ===")
+_sva = dict(live=c.LIVE, lp=c.live_positions, ca=c.cancel, os_=c.order_status, pn=c.price_now, g=c.GR_FILL_LIQ_MIN,
+            l30=c.liq30, sp=c.specs, tp=c.limit_buy_tp, sm=c.stop_market_buy, ms=c.market_short, sl=c.set_lev,
+            cg=c.cancel_algo, mb=c.mkt_buy_close, rc=c.real_close_fill, ao=c.algo_open_ids)
+c.LIVE = True; c.live_positions = lambda: {}; c.price_now = lambda s: 0.35
+c.specs = lambda s: {"tick": 0.0001, "pp": 4, "step": 0.1, "qp": 1, "minq": 0.1, "minn": 5.0}
+_ac = {"cancel": [], "tp": [], "sl": [], "cover": []}
+c.cancel = lambda sym, oid: (_ac["cancel"].append((sym, oid)), {"orderId": oid})[1]
+c.limit_buy_tp = lambda sym, qty, px: (_ac["tp"].append((sym, qty)), {"orderId": 111})[1]
+c.stop_market_buy = lambda sym, trig: (_ac["sl"].append((sym, trig)), {"algoId": 222})[1]
+# BUG-1: S-LIQDROP races a fill -> position must be OPENED WITH SL, never orphaned
+c.GR_FILL_LIQ_MIN = 1000.0; c.liq30 = lambda s: 100.0        # catalyst dead -> cancel path
+c.order_status = lambda sym, oid: {"status": "CANCELED", "executedQty": "63.9", "avgPrice": "0.3518"}   # ...but it FILLED first
+def _rpos():
+    return {"coin": "RACEUSDT", "state": "PENDING", "oid": 6001, "entry": 0.3518, "qty": 156.7, "stop": 0.357,
+            "tp": None, "tp_oid": None, "sl_oid": None, "ts": c.now(), "fill_deadline": c.now()+9999,
+            "cts": 1, "tf": "15m", "risk_frac": 0.015, "minlow": None, "added": False}
+str1 = {"long": [], "short": [_rpos()], "mom": [], "snap": [], "trend": [], "squeeze": [], "wins": 0, "losses": 0,
+        "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}}
+c.manage_short(str1)
+ok(len(str1["short"]) == 1 and str1["short"][0]["state"] == "OPEN" and abs(str1["short"][0]["qty"] - 63.9) < 1e-9
+   and _ac["sl"], "BUG-1: liqdrop cancel raced a fill -> position OPENED at executedQty WITH a stop (no orphan)")
+# ...and the clean case still removes
+_ac["cancel"].clear(); _ac["sl"].clear()
+c.order_status = lambda sym, oid: {"status": "CANCELED", "executedQty": "0", "avgPrice": "0"}
+str2 = {"long": [], "short": [_rpos()], "mom": [], "snap": [], "trend": [], "squeeze": [], "wins": 0, "losses": 0,
+        "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}}
+c.manage_short(str2)
+ok(len(str2["short"]) == 0, "BUG-1: liqdrop with a genuinely unfilled order removes cleanly")
+c.GR_FILL_LIQ_MIN = _sva["g"]; c.liq30 = _sva["l30"]
+# BUG-3: E5 market order that matched nothing must NOT create a position
+c.SQF_ENABLED = True; _svcap = c.SQF_CAP; c.SQF_CAP = 1
+c.set_lev = lambda s: None
+c.market_short = lambda sym, qty: {"orderId": 9100, "executedQty": "0"}
+c.order_status = lambda sym, oid: {"status": "EXPIRED", "executedQty": "0"}
+_svsq, _svpm = c.squeeze_liq, c.pump15
+c.pump15 = lambda s: 2.0
+c.squeeze_liq = lambda s: (99999.0, 99999.0, 1.0)
+c.price_now = lambda s: 1.0
+stn = {"long": [], "short": [], "mom": [], "snap": [], "trend": [], "squeeze": [], "wins": 0, "losses": 0,
+       "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}}
+c._LAST_SQ_BAR[0] = -1
+c.open_squeeze(stn, ["NOFILLUSDT"])
+ok(len(stn["squeeze"]) == 0, "BUG-3: zero-fill market order -> SQF-NOFILL, no phantom position")
+# BUG-2: E5 partial fill -> qty from executedQty; LIVE TIME-exit covers the EXCHANGE amt and checked result
+c.market_short = lambda sym, qty: {"orderId": 9101, "executedQty": "40.0", "avgPrice": "1.001"}
+stp2 = {"long": [], "short": [], "mom": [], "snap": [], "trend": [], "squeeze": [], "wins": 0, "losses": 0,
+        "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}}
+c._LAST_SQ_BAR[0] = -1
+c.open_squeeze(stp2, ["PARTUSDT"])
+ok(len(stp2["squeeze"]) == 1 and abs(stp2["squeeze"][0]["qty"] - 40.0) < 1e-9,
+   "BUG-2a: partial taker fill -> position sized at executedQty (40), stop for the real size")
+c.live_positions = lambda: {("PARTUSDT", "SHORT"): -40.0}
+c.mkt_buy_close = lambda sym, qty: (_ac["cover"].append((sym, qty)), {"_error": True, "_body": "rejected"})[1]
+c.cancel_algo = lambda sym, aid: None
+c.real_close_fill = lambda sym, side, ts: None
+stp2["squeeze"][0]["fill_ts"] = c.now() - (c.SQF_HOLD_MIN*60 + 5)
+c.manage_squeeze(stp2)
+ok(len(stp2["squeeze"]) == 1 and _ac["cover"] and abs(_ac["cover"][0][1] - 40.0) < 1e-9,
+   "BUG-2b: cover uses the EXCHANGE amt; rejected cover -> position KEPT for retry (stop still armed)")
+c.mkt_buy_close = lambda sym, qty: {"orderId": 1}
+c.manage_squeeze(stp2)
+ok(len(stp2["squeeze"]) == 0 and stp2["wins"] + stp2["losses"] == 1, "BUG-2b: successful cover books and removes")
+# LOW-1: manual flatten (position gone, algo still open) books as 'closed', does NOT feed the breaker
+c.live_positions = lambda: {}
+c.algo_open_ids = lambda sym: {"777"}
+stm = {"long": [], "short": [], "mom": [], "snap": [], "trend": [], "squeeze": [{"coin": "MANUSDT", "state": "OPEN",
+       "entry": 1.0, "qty": 10.0, "stop": 1.04, "sl_oid": 777, "ts": c.now(), "fill_ts": c.now(), "maxadv": 1.0}],
+       "wins": 0, "losses": 0, "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}, "fade_streak": 0}
+c.price_now = lambda s: 1.02
+c.manage_squeeze(stm)
+ok(len(stm["squeeze"]) == 0 and stm["fade_streak"] == 0 and "MANUSDT" not in stm["fade_sl_ts"],
+   "LOW-1: manual flatten -> tag 'closed', breaker counters untouched")
+c.SQF_CAP = _svcap; c.squeeze_liq = _svsq; c.pump15 = _svpm
+# BUG-4/5 wiring pins: every arm path uses held_all; reconcile enumerates squeeze
+import inspect
+for fn in (c.open_snapback, c.open_trend, c.open_momentum, c.open_long, c.open_short, c.open_squeeze):
+    ok("held_all" in inspect.getsource(fn), f"BUG-4: {fn.__name__} uses held_all (cross-leg exclusion wired)")
+_rsrc = inspect.getsource(c.reconcile_orders)
+ok('"squeeze"' in _rsrc, "BUG-5: reconcile_orders enumerates the squeeze leg (no false alarms, stop survives restart)")
+c.LIVE = _sva["live"]; c.live_positions = _sva["lp"]; c.cancel = _sva["ca"]; c.order_status = _sva["os_"]
+c.price_now = _sva["pn"]; c.specs = _sva["sp"]; c.limit_buy_tp = _sva["tp"]; c.stop_market_buy = _sva["sm"]
+c.market_short = _sva["ms"]; c.set_lev = _sva["sl"]; c.cancel_algo = _sva["cg"]; c.mkt_buy_close = _sva["mb"]
+c.real_close_fill = _sva["rc"]; c.algo_open_ids = _sva["ao"]; c.SQF_ENABLED = _sve["sqe"]
 
 print(f"\n{'='*40}\n{P} passed, {F} failed")
 sys.exit(1 if F else 0)

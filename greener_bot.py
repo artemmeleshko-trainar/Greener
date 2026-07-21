@@ -241,6 +241,7 @@ SQF_HOLD_MIN      = int(os.environ.get("SQF_HOLD_MIN", "60"))       # TIME exit 
 SQF_SL            = float(os.environ.get("SQF_SL", "0.04"))         # catastrophe stop ONLY (+4%)
 SQF_CAP           = int(os.environ.get("SQF_CAP", "0"))             # max concurrent squeeze-fades. 0 = engine takes no slots.
 SQF_COOLDOWN_MIN  = int(os.environ.get("SQF_COOLDOWN_MIN", "60"))   # one squeeze-fade per coin per this many minutes
+SQF_SCAN_MAX      = int(os.environ.get("SQF_SCAN_MAX", "12"))       # liq-call burst cap per 1m scan (top pumps first) — Coinalyze free tier safety
 
 # ========================= MOMENTUM LEG (v4 config A "Drive") — ported from momentum_engine.py =========================
 # THIRD strategy merged into the shared pool: LONG-ONLY multi-setup momentum on a MOVERS universe (full perp pool ranked
@@ -865,7 +866,7 @@ def open_snapback(st):
     if cur_bar == _LAST_SNAP_BAR: return              # already scanned this 1m bar
     _LAST_SNAP_BAR = cur_bar
     if btc_distribution(): return                     # macro flush in progress — not an absorbable overshoot
-    open_syms = held_long(st) | held_short(st) | held_mom(st) | held_snap(st) | held_trend(st)   # never double-book across long legs
+    open_syms = held_all(st)   # AUDIT BUG-4: cross-leg exclusion incl. squeeze (a long on a squeeze-shorted coin = hedge-mode fee bleed)
     margin = (st["equity"] / TOTAL_SLOTS) if st["equity"] else 0
     for sym in snap_liquid_universe():
         if not can_open(st, "snap"): break
@@ -991,15 +992,24 @@ def open_squeeze(st, watch):
     _LAST_SQ_BAR[0] = cur_bar
     open_syms = held_all(st)
     margin = (st["equity"] / TOTAL_SLOTS) if st["equity"] else 0
-    for sym in watch:
+    # AUDIT BUG-6: pump15 for the whole universe CONCURRENTLY (a serial 150-coin sweep froze the 2s manage loop ~30s),
+    # then Coinalyze liq calls ONLY for the top-SQF_SCAN_MAX pumps (burst cap: a market-wide pump would otherwise fire
+    # 30+ liq calls into the ~40/min shared free tier and blind the S1 fill-gate with 429s).
+    elig = [s for s in watch if s not in open_syms
+            and now() - _SQ_COOLDOWN.get(s, 0) >= SQF_COOLDOWN_MIN * 60
+            and not (S_COIN_COOLDOWN_SEC > 0 and st.get("fade_sl_ts", {}).get(s, 0)
+                     and now() - st["fade_sl_ts"][s] < S_COIN_COOLDOWN_SEC)]
+    pumps = _pmap(pump15, elig)
+    cands = sorted(((pm, s) for s, pm in zip(elig, pumps) if pm is not None and pm >= SQF_PUMP_MIN), reverse=True)
+    for pm, sym in cands[:SQF_SCAN_MAX]:
         if not can_open(st, "squeeze"): break
-        if sym in open_syms: continue
-        if now() - _SQ_COOLDOWN.get(sym, 0) < SQF_COOLDOWN_MIN * 60: continue
-        if S_COIN_COOLDOWN_SEC > 0:                                                  # respect the per-coin fade-stop cooldown too
-            last_sl = st.get("fade_sl_ts", {}).get(sym, 0)
-            if last_sl and now() - last_sl < S_COIN_COOLDOWN_SEC: continue
-        sig = squeeze_signal(sym)
-        if not sig: continue
+        ls = squeeze_liq(sym)
+        if ls is None: continue
+        S5, S15, L15 = ls
+        if S5 < SQF_S5_MIN or not (S15 > SQF_DOM * L15): continue
+        px = price_now(sym)
+        if px is None: continue
+        sig = {"px": px, "S5": S5, "S15": S15, "L15": L15, "pm15": pm}
         entry = sig["px"]; sp = specs(sym)
         if not sp: continue
         qty, sp = calc_qty(sym, entry, margin * LEV * E_SIZE_FRAC)
@@ -1007,9 +1017,16 @@ def open_squeeze(st, watch):
         log(f"SQF-ARM {sym}: squeeze SELL {qty} @ {fmt(entry)} S5 ${sig['S5']:,.0f} S15/L15 ${sig['S15']:,.0f}/${sig['L15']:,.0f} pump{sig['pm15']:+.1f}%")
         if LIVE:
             set_lev(sym); r = market_short(sym, qty)
-            if not (isinstance(r, dict) and not r.get("_error") and (r.get("orderId") or float(r.get("executedQty", 0) or 0) > 0)):
+            if not (isinstance(r, dict) and not r.get("_error")):
                 log(f"SQF-REJECT {sym}: {str(r)[:90]}"); continue
-            fill = float(r.get("avgPrice") or 0) if isinstance(r, dict) else 0
+            exq = float(r.get("executedQty", 0) or 0)
+            if exq <= 0 and r.get("orderId"):                  # AUDIT BUG-3: a MARKET order that matched nothing must NOT become a
+                stq = order_status(sym, r["orderId"])          # phantom position. One re-query: async fill -> take it; still 0 -> skip.
+                if isinstance(stq, dict): exq = float(stq.get("executedQty", 0) or 0); r = stq if exq > 0 else r
+            if exq <= 0:
+                log(f"SQF-NOFILL {sym}: market order matched nothing (executedQty=0) — no position, skipping"); continue
+            qty = exq                                          # AUDIT BUG-2a: size the position at what ACTUALLY filled (thin books
+            fill = float(r.get("avgPrice") or 0)               # during cascades = partial taker fills are real)
             if fill > 0: entry = fill
         sl_px = round_tick(entry * (1 + SQF_SL), sp)
         sl_oid = None
@@ -1032,19 +1049,28 @@ def manage_squeeze(st):
         sym = pos["coin"]; px = price_now(sym)
         if px is None: continue
         pos["maxadv"] = max(pos.get("maxadv", pos["entry"]), px)
+        amt = abs(realpos.get((sym, "SHORT"), 0.0)) if LIVE else pos["qty"]
         tag = None
         if px >= pos["stop"]: tag = "SL"
         elif now() - pos["fill_ts"] >= SQF_HOLD_MIN * 60: tag = "TIME"
-        if LIVE and tag is None and abs(realpos.get((sym, "SHORT"), 0.0)) < pos["qty"] * 0.5:
-            tag = "SL"                                       # native stop covered us on the exchange
+        if LIVE and tag is None and amt < pos["qty"] * 0.5:
+            # position gone from the exchange: native stop OR a manual close/ADL. Distinguish like the fade leg does —
+            # only a fired stop counts as "SL" (feeds the breaker); a manual flatten books as "closed" (AUDIT LOW-1).
+            algos = algo_open_ids(sym) if pos.get("sl_oid") else set()
+            stopped = (not pos.get("sl_oid")) or (str(pos["sl_oid"]) not in algos)
+            tag = "SL" if stopped else "closed"
         if not tag: continue
         exit_px = px
         if LIVE:
+            if amt >= pos["qty"] * 0.5:                       # position still on the exchange -> close it FIRST, verify, then drop the algo
+                r = mkt_buy_close(sym, amt)                   # AUDIT BUG-2b: close the EXCHANGE amt (not pos qty) and CHECK the result
+                if isinstance(r, dict) and r.get("_error"):
+                    log(f"SQF-CLOSE-RETRY {sym}: cover rejected ({str(r.get('_body',''))[:60]}) — keeping position, retry next tick")
+                    continue                                  # stop algo still armed; nothing booked; retry next tick
             if pos.get("sl_oid"): cancel_algo(sym, pos["sl_oid"])
-            if abs(realpos.get((sym, "SHORT"), 0.0)) >= pos["qty"] * 0.5: mkt_buy_close(sym, pos["qty"])
             real = real_close_fill(sym, "BUY", pos.get("ts", now()))
             if real: exit_px = real
-        exit_tel(sym, "short", tag, pos, px, (exit_px if LIVE else None))
+        exit_tel(sym, "squeeze", tag, pos, px, (exit_px if LIVE else None))
         book(st, "squeeze", pos, exit_px, tag)
         try: st["squeeze"].remove(pos)
         except ValueError: pass
@@ -1136,7 +1162,7 @@ def open_trend(st):
     if day == _LAST_TREND_DAY: return                     # scan once per day (daily bars only change at UTC midnight)
     _LAST_TREND_DAY = day
     if not trend_regime_ok(): return                      # risk-off: stand down (per-coin SMA still required below too)
-    open_syms = held_long(st) | held_short(st) | held_mom(st) | held_snap(st) | held_trend(st)
+    open_syms = held_all(st)   # AUDIT BUG-4: cross-leg exclusion incl. squeeze (a long on a squeeze-shorted coin = hedge-mode fee bleed)
     margin = (st["equity"] / TOTAL_SLOTS) if st["equity"] else 0
     for sym in trend_universe():
         if not can_open(st, "trend"): break
@@ -1227,7 +1253,7 @@ def open_long(st, watch):
     if now() < st.get("paused_until", 0): return
     if not can_open(st, "long"): return
     margin = (st["equity"] / TOTAL_SLOTS) if st["equity"] else 0
-    have = held_long(st); cands = []; nqual = 0
+    have = held_all(st); cands = []; nqual = 0   # AUDIT BUG-4: dip exclusion sees ALL legs
     for sym in watch:
         up, ref, mom, illiq = trend_ref(sym)
         if up and ref and mom <= L_MOM_CAP:
@@ -1575,10 +1601,13 @@ def manage_short(st):
             if GR_FILL_LIQ_MIN > 0:                            # GREENER S1: the resting limit may only live while the catalyst is alive
                 v = liq30(sym)                                 # (cached 55s -> ~1 API call/min per pending coin)
                 if v is not None and v < GR_FILL_LIQ_MIN:
-                    if LIVE and pos.get("oid"): cancel(sym, pos["oid"])
-                    st["short"].remove(pos)
-                    log(f"S-LIQDROP {sym}: liq30 ${v:,.0f} < ${GR_FILL_LIQ_MIN:,.0f} — catalyst died, retest cancelled | {n_open(st)}/{TOTAL_SLOTS}")
-                    continue
+                    log(f"S-LIQDROP {sym}: liq30 ${v:,.0f} < ${GR_FILL_LIQ_MIN:,.0f} — catalyst died, cancelling retest | {n_open(st)}/{TOTAL_SLOTS}")
+                    if LIVE and pos.get("oid"):
+                        cancel(sym, pos["oid"])                # AUDIT BUG-1 FIX: do NOT remove blindly — the retest fills exactly when the
+                        # flush ends (correlated race). Fall through: the order_status re-query below sees either CANCELED
+                        # with executedQty=0 (-> removed) or executedQty>0 (-> opened WITH its SL). Never a naked short.
+                    else:
+                        st["short"].remove(pos); continue
             filled = False; entry = pos["entry"]
             if LIVE:
                 stt = order_status(sym, pos["oid"]); s = stt.get("status") if isinstance(stt, dict) else None
@@ -1589,7 +1618,13 @@ def manage_short(st):
                         if isinstance(stt2, dict) and float(stt2.get("executedQty", 0) or 0) > 0:   # just fully filled, cancel errors and the
                             stt = stt2                                                              # re-query sees FILLED with the full qty.
                     filled = True; entry = float(stt.get("avgPrice") or pos["entry"]); pos["qty"] = float(stt["executedQty"])
-                elif s in ("CANCELED", "EXPIRED", "REJECTED"): st["short"].remove(pos); continue
+                elif s in ("CANCELED", "EXPIRED", "REJECTED"):
+                    if float(stt.get("executedQty", 0) or 0) > 0:   # AUDIT BUG-1: a cancelled order that FILLED first (S-LIQDROP race,
+                        filled = True                               # expire race) = a REAL position -> open it with its SL, never orphan it
+                        entry = float(stt.get("avgPrice") or pos["entry"]); pos["qty"] = float(stt["executedQty"])
+                        log(f"S-FILL-ON-CANCEL {sym}: order cancelled but executedQty={pos['qty']} — opening WITH SL")
+                    else:
+                        st["short"].remove(pos); continue
             else:
                 if px and px >= pos["entry"]: filled = True
             if filled:
@@ -1830,7 +1865,7 @@ def open_momentum(st):
         if u: _MUNI = u; _MUNI_TS = now(); _MRS = dict(u); log(f"M-UNIVERSE re-ranked: {len(u)} movers, top={_MUNI[0][0]}")
     if st.get("day_eq") and st["equity"] > 0 and (st["equity"]/st["day_eq"]-1) <= -0.08:
         return                                           # -8% day: halt NEW momentum entries (armed runners keep riding)
-    open_syms = held_long(st) | held_short(st) | held_mom(st) | held_snap(st) | held_trend(st)   # never double-book a coin across legs
+    open_syms = held_all(st)   # AUDIT BUG-4: cross-leg exclusion incl. squeeze (a long on a squeeze-shorted coin = hedge-mode fee bleed)
     margin = (st["equity"]/TOTAL_SLOTS) if st["equity"] else 0
     _MSCAN["gate"] = 0; _MSCAN["trig"] = 0                         # DIAG: reset per-bar scan counters
     armed_before = len(st.get("mom", []))
@@ -2029,7 +2064,7 @@ def reconcile_orders(st):
     NOT auto-close — on untracked positions. Fixes the 'phantom slots' bug (exchange had 5 long limits, bot tracked 2)."""
     if not LIVE: return 0
     tracked = set()
-    for leg in ("long", "short", "mom", "snap", "trend"):
+    for leg in ("long", "short", "mom", "snap", "trend", "squeeze"):   # AUDIT BUG-5: squeeze incl.
         for p in st.get(leg, []):
             for kf in ("oid", "tp_oid", "sl_oid"):
                 v = p.get(kf)
@@ -2054,7 +2089,8 @@ def reconcile_orders(st):
                    {(p["coin"], "LONG") for p in st.get("mom", []) if p.get("state") == "OPEN"} |
                    {(p["coin"], "LONG") for p in st.get("snap", []) if p.get("state") == "OPEN"} |
                    {(p["coin"], "LONG") for p in st.get("trend", []) if p.get("state") == "OPEN"} |
-                   {(p["coin"], "SHORT") for p in st.get("short", []) if p.get("state") == "OPEN"})
+                   {(p["coin"], "SHORT") for p in st.get("short", []) if p.get("state") == "OPEN"} |
+                   {(p["coin"], "SHORT") for p in st.get("squeeze", []) if p.get("state") == "OPEN"})   # AUDIT BUG-5
     try:
         for (sym, side), amt in live_positions().items():
             if abs(amt) > 0 and (sym, side) not in tracked_pos:
@@ -2086,6 +2122,9 @@ def main():
         f"{'E5-SQF ON (S5≥$'+format(SQF_S5_MIN,',.0f')+' hold'+str(SQF_HOLD_MIN)+'m SL+'+format(SQF_SL*100,'.0f')+'%)' if SQF_ENABLED else 'E5-SQF off'} | "
         f"DIP=maker dip-buy (TP+{L_TP}% trail@{L_TRAIL_ACT*100:.1f}%/{L_TRAIL*100:.1f}%{' OI-HARD' if L_OI_CAPIT else (f' OI-SOFT{L_OI_CAPIT_SOFT}' if L_OI_CAPIT_SOFT else '')}) | "
         f"FADE={stfs} (R{S_R} {f'CHANDELIER{S_CHAND_K}xATR@{S_CHAND_ARM*100:.0f}%' if S_CHAND else f'trail@{S_TRAIL_ACT*100:.0f}%/{S_TRAIL*100:.1f}%'}{f' liq-gate≥${S_LIQ_MIN:.0f}' if S_LIQ_MIN else ''}) | {mband} | {aband} | {bband} | {dband} | {eband} | hedge={HEDGE}")
+    if (GR_FILL_LIQ_MIN > 0 or SQF_ENABLED) and not COINALYZE_KEY:   # AUDIT BUG-7: a missing key silently kills BOTH short engines
+        log("🔴🔴 COINALYZE_KEY MISSING but GR_FILL_LIQ_MIN/SQF_ENABLED are ON — the S1 fade gate FAIL-CLOSES every arm and E5 self-idles. THE SHORT SIDE WILL NOT TRADE. Fix the systemd env.")
+        _tg("🔴🔴 <b>GREENER: COINALYZE_KEY missing</b> — short side (fade gate + E5) will NOT trade until the key is set!")
     reconcile_orders(st)        # cancel orphan/duplicate exchange orders left by a mid-arm restart (prevents phantom-slot bug)
     watch = []; last_watch = 0
     while True:
