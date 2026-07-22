@@ -22,7 +22,7 @@ born 21-07-2026 from the WR70 research program:
 | slot | engine | thesis | evidence |
 |---|---|---|---|
 | S1 | **FADE + liq-at-fill gate** | short a busted pump, but ONLY while trapped longs are actively liquidating (trailing-30min long-liq ≥ $1k at/into the fill) + **TP 0.5% / SL 1.5%** | WR70 study candidate #1: **84.4% WR, +0.136%/tr** after fees+measured slippage, n=64, survived in-era OOS/concentration/jackknife. Grade B — forward-validating live |
-| S2 | **E5 SQUEEZE-FADE** (from clever-bot) | taker sell into a SHORT-liq flush spike; exit = TIME 60m or +4% catastrophe stop; NO TP/trail | 4/4 OOS windows, +0.297%/tr on the long tape; **WR ~48% BY DESIGN** — judge on expectancy, not WR |
+| S2 | **E5 SQUEEZE-FADE** (from clever-bot) | taker sell into a SHORT-liq flush spike; exits = **TRAIL** (arm on first +0.3% green; width 0.3% first 10min → 0.75% after; **NATIVE STOP_MARKET rests at the trail level** — FIX-A, ratcheted ≥5bp) + TIME 60m + +4% catastrophe stop | trail tuned 22-07 on the 12 real night-1 paths (Artem's call: "bank the early green, monsters be damned"); FIX-A killed the 2s-poll overshoot (0.08-0.31% on every armed exit). WR ~48%→up with trail; judge on NET expectancy |
 | L1 | **SNAP** (liq-snapback) | buy the V-reclaim after a long-liq flush ≥$400k on liquid top-40 | PF 1.56 one window; the tape that stops the fades FILLS the snaps = squeeze hedge |
 | L2 | **DIP** (ballast) | maker −1.2% dip-buy behind the full gate stack, tight trail | ~breakeven engine; exists to flatten book beta, not to earn |
 
@@ -77,6 +77,8 @@ Keys live at `/root/v2bot/data/secrets/binance.env` (legacy path). Binance keys 
 | S1 gate off (plain fade) | `GR_FILL_LIQ_MIN=0` in greener.conf → reload → restart |
 | S1 exits back to symmetric | `S_SL_FIXED=0.005` |
 | E5 off / snap off / dip off | `SQF_ENABLED=0` / `SNAP_CAP=0` / `M_DIP_CAP=0` |
+| E5 trail off (revert to pure TIME60+SL4) | `SQF_TRAIL_ACT=0` |
+| E5 native trail stop off (software poll only) | `SQF_TRAIL_NATIVE=0` |
 
 ## 6. COMMANDS (on the VPS)
 ```bash
