@@ -253,6 +253,13 @@ SQF_TRAIL_ACT       = float(os.environ.get("SQF_TRAIL_ACT", "0"))
 SQF_TRAIL           = float(os.environ.get("SQF_TRAIL", "0.0075"))
 SQF_TRAIL_EARLY     = float(os.environ.get("SQF_TRAIL_EARLY", "0.003"))
 SQF_TRAIL_EARLY_MIN = int(os.environ.get("SQF_TRAIL_EARLY_MIN", "10"))
+# FIX-A (22-07, Artem): NATIVE exchange trailing stop. The software 2s-poll trail books at whatever price the poll catches —
+# on violent squeeze bounces that overshot the stop by 0.08-0.31% on ALL THREE armed exits of the trail era (ACE: stop
+# 0.098715, booked 0.0990179 = peak +$0.33 turned into −$0.04). Fix: on arm, REST a real STOP_MARKET BUY at the trail level;
+# ratchet it via cancel/replace, throttled to >=SQF_TRAIL_REPLACE_BP improvement (API churn guard). The +4% catastrophe stop
+# stays resting the whole time (covers the cancel->place gap); the software poll remains as a belt-and-braces fallback.
+SQF_TRAIL_NATIVE     = os.environ.get("SQF_TRAIL_NATIVE", "1") not in ("0", "false", "False", "no")
+SQF_TRAIL_REPLACE_BP = float(os.environ.get("SQF_TRAIL_REPLACE_BP", "0.0005"))   # min stop move (frac) to justify cancel/replace
 
 # ========================= MOMENTUM LEG (v4 config A "Drive") — ported from momentum_engine.py =========================
 # THIRD strategy merged into the shared pool: LONG-ONLY multi-setup momentum on a MOVERS universe (full perp pool ranked
@@ -1071,13 +1078,24 @@ def manage_squeeze(st):
                 log(f"SQF-TRAIL-ARM {sym} @ {fmt(px)} (fav {(pos['entry']-pos['minlow'])/pos['entry']*100:+.2f}%)")
             if pos.get("sq_armed"):
                 w = SQF_TRAIL_EARLY if (now() - pos["fill_ts"]) < SQF_TRAIL_EARLY_MIN * 60 else SQF_TRAIL
-                if px >= pos["minlow"] * (1 + w): tag = "TRAIL"
+                sp_t = specs(sym)
+                tstop = round_tick(pos["minlow"] * (1 + w), sp_t) if sp_t else pos["minlow"] * (1 + w)
+                if LIVE and SQF_TRAIL_NATIVE:                            # FIX-A: rest a REAL stop at the trail level (no 2s-poll overshoot)
+                    cur = pos.get("tr_stop")
+                    if cur is None or abs(tstop - cur) / cur >= SQF_TRAIL_REPLACE_BP:   # throttle: replace on >=5bp moves only
+                        if pos.get("tr_oid"): cancel_algo(sym, pos["tr_oid"])           # catastrophe stop still resting -> gap covered
+                        rt = stop_market_buy(sym, tstop)
+                        pos["tr_oid"] = rt.get("algoId") if isinstance(rt, dict) and not rt.get("_error") else None
+                        pos["tr_stop"] = tstop
+                if px >= tstop: tag = "TRAIL"                            # software fallback (paper mode / native-miss belt)
         if LIVE and tag is None and amt < pos["qty"] * 0.5:
-            # position gone from the exchange: native stop OR a manual close/ADL. Distinguish like the fade leg does —
-            # only a fired stop counts as "SL" (feeds the breaker); a manual flatten books as "closed" (AUDIT LOW-1).
-            algos = algo_open_ids(sym) if pos.get("sl_oid") else set()
-            stopped = (not pos.get("sl_oid")) or (str(pos["sl_oid"]) not in algos)
-            tag = "SL" if stopped else "closed"
+            # position gone from the exchange: the NATIVE TRAIL stop, the catastrophe stop, OR a manual close/ADL.
+            # Distinguish by which algo vanished — only real stops feed the counters; manual flatten books "closed".
+            algos = algo_open_ids(sym) if (pos.get("sl_oid") or pos.get("tr_oid")) else set()
+            if pos.get("tr_oid") and str(pos["tr_oid"]) not in algos: tag = "TRAIL"     # FIX-A: the native trail fired
+            elif pos.get("sl_oid") and str(pos["sl_oid"]) not in algos: tag = "SL"      # catastrophe stop fired
+            elif not pos.get("sl_oid") and not pos.get("tr_oid"): tag = "SL"            # no algos tracked -> conservative
+            else: tag = "closed"                                                         # both algos still resting -> manual
         if not tag: continue
         exit_px = px
         if LIVE:
@@ -1087,6 +1105,7 @@ def manage_squeeze(st):
                     log(f"SQF-CLOSE-RETRY {sym}: cover rejected ({str(r.get('_body',''))[:60]}) — keeping position, retry next tick")
                     continue                                  # stop algo still armed; nothing booked; retry next tick
             if pos.get("sl_oid"): cancel_algo(sym, pos["sl_oid"])
+            if pos.get("tr_oid"): cancel_algo(sym, pos["tr_oid"])   # FIX-A: drop the native trail stop too
             real = real_close_fill(sym, "BUY", pos.get("ts", now()))
             if real: exit_px = real
         exit_tel(sym, "squeeze", tag, pos, px, (exit_px if LIVE else None))

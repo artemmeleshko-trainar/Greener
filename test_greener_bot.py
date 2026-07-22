@@ -1093,5 +1093,64 @@ ok(len(s5["squeeze"]) == 1 and not s5["squeeze"][0].get("sq_armed"), "SQF_TRAIL_
 c.SQF_TRAIL_ACT = _svt["a"]; c.SQF_TRAIL = _svt["w"]; c.SQF_TRAIL_EARLY = _svt["e"]; c.SQF_TRAIL_EARLY_MIN = _svt["m"]
 c.LIVE = _svt["live"]; c.price_now = _svt["pn"]; c.live_positions = _svt["lp"]
 
+print("\n=== FIX-A (22-07): NATIVE trail stop — placed on arm, ratcheted throttled, tags exits correctly ===")
+_svn = dict(nat=c.SQF_TRAIL_NATIVE, act=c.SQF_TRAIL_ACT, live=c.LIVE, pn=c.price_now, lp=c.live_positions,
+            sm=c.stop_market_buy, cg=c.cancel_algo, sp=c.specs, ao=c.algo_open_ids, mb=c.mkt_buy_close, rc=c.real_close_fill)
+c.LIVE = True; c.SQF_TRAIL_NATIVE = True; c.SQF_TRAIL_ACT = 0.003
+c.specs = lambda s: {"tick": 0.0001, "pp": 4, "step": 0.1, "qp": 1, "minq": 0.1, "minn": 5.0}
+c.live_positions = lambda: {("NTUSDT", "SHORT"): -10.0}
+_nc = {"place": [], "cancel": []}
+c.stop_market_buy = lambda sym, trig: (_nc["place"].append(round(trig, 4)), {"algoId": 500 + len(_nc["place"])})[1]
+c.cancel_algo = lambda sym, aid: _nc["cancel"].append(aid)
+c.mkt_buy_close = lambda sym, qty: {"orderId": 1}
+c.real_close_fill = lambda sym, side, ts: None
+def _npos(**kw):
+    p = {"coin": "NTUSDT", "state": "OPEN", "entry": 100.0, "qty": 10.0, "stop": 104.0, "sl_oid": 999,
+         "ts": c.now(), "fill_ts": c.now() - 60, "maxadv": 100.0}
+    p.update(kw); return p
+# 1) arm -> native stop rests at minlow*(1+early)
+c.price_now = lambda s: 99.5                                   # fav 0.5% -> arms; minlow 99.5 -> stop 99.7985 (rounded)
+s1 = _tst(_npos()); s1["squeeze"] = [s1["squeeze"][0]] if s1["squeeze"] else []
+s1 = {"long": [], "short": [], "mom": [], "snap": [], "trend": [], "squeeze": [_npos()], "wins": 0, "losses": 0,
+      "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}, "fade_streak": 0}
+c.manage_squeeze(s1)
+ok(len(_nc["place"]) == 1 and abs(_nc["place"][0] - 99.7985) < 0.01 and s1["squeeze"][0].get("tr_oid") == 501,
+   "FIX-A: on arm, a NATIVE stop rests at minlow*(1+early) and its algoId is tracked")
+# 2) ratchet: big improvement -> cancel+replace; tiny improvement -> throttled (no replace)
+c.price_now = lambda s: 99.0                                   # new minlow 99.0 -> stop 99.297 (move ~0.5% > 5bp)
+c.manage_squeeze(s1)
+ok(len(_nc["place"]) == 2 and _nc["cancel"] == [501] and s1["squeeze"][0].get("tr_oid") == 502,
+   "FIX-A: ratchet cancel/replaces to the lower stop")
+c.price_now = lambda s: 98.99                                  # minlow 98.99 -> stop 99.2870 (move ~1bp < 5bp)
+c.manage_squeeze(s1)
+ok(len(_nc["place"]) == 2, "FIX-A: sub-5bp improvement is THROTTLED (no API churn)")
+# 3) native trail fired on the exchange (position gone, trail algo missing) -> tag TRAIL, books
+c.live_positions = lambda: {}                                  # position gone
+c.algo_open_ids = lambda sym: {"999"}                          # catastrophe still resting; trail algo (502) GONE
+c.price_now = lambda s: 99.3
+c.manage_squeeze(s1)
+ok(len(s1["squeeze"]) == 0 and s1["wins"] == 1, "FIX-A: exchange-fired native trail -> tag TRAIL (booked win), both algos cleaned")
+# 4) manual flatten: BOTH algos still resting -> 'closed', counters untouched
+_nc["place"].clear(); _nc["cancel"].clear()
+c.live_positions = lambda: {}
+c.algo_open_ids = lambda sym: {"999", "777"}
+s4 = {"long": [], "short": [], "mom": [], "snap": [], "trend": [], "squeeze": [_npos(sq_armed=True, tr_oid=777, tr_stop=99.7985, minlow=99.5)],
+      "wins": 0, "losses": 0, "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}, "fade_streak": 0}
+c.price_now = lambda s: 99.9
+c.manage_squeeze(s4)
+ok(len(s4["squeeze"]) == 0 and s4["fade_streak"] == 0 and "NTUSDT" not in s4["fade_sl_ts"],
+   "FIX-A: manual flatten (both algos resting) -> 'closed', breaker counters untouched")
+# 5) paper mode: no native calls
+c.LIVE = False
+_nc["place"].clear()
+s5 = {"long": [], "short": [], "mom": [], "snap": [], "trend": [], "squeeze": [_npos()], "wins": 0, "losses": 0,
+      "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}, "fade_streak": 0}
+c.price_now = lambda s: 99.5
+c.manage_squeeze(s5)
+ok(len(_nc["place"]) == 0, "FIX-A: paper mode places no native stops (software trail only)")
+c.SQF_TRAIL_NATIVE = _svn["nat"]; c.SQF_TRAIL_ACT = _svn["act"]; c.LIVE = _svn["live"]; c.price_now = _svn["pn"]
+c.live_positions = _svn["lp"]; c.stop_market_buy = _svn["sm"]; c.cancel_algo = _svn["cg"]; c.specs = _svn["sp"]
+c.algo_open_ids = _svn["ao"]; c.mkt_buy_close = _svn["mb"]; c.real_close_fill = _svn["rc"]
+
 print(f"\n{'='*40}\n{P} passed, {F} failed")
 sys.exit(1 if F else 0)
