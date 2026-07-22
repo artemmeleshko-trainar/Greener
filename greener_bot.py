@@ -478,6 +478,12 @@ def stop_market_buy(sym, trig):                     # native algo stop for SHORT
          "triggerPrice": trig, "closePosition": "true"}
     if HEDGE: p["positionSide"] = "SHORT"
     return _signed("/fapi/v1/algoOrder", p)
+def stop_market_buy_rq(sym, qty, trig):             # FIX-A3: TRAIL stop for SHORT = qty-based (NOT closePosition) — Binance allows only
+    p = {"symbol": sym, "side": "BUY", "type": "STOP_MARKET", "algoType": "CONDITIONAL",   # ONE closePosition STOP_MARKET per side, so
+         "triggerPrice": trig, "quantity": qty}                                            # the trail must coexist with the catastrophe
+    if HEDGE: p["positionSide"] = "SHORT"           # hedge mode: positionSide implies reduce; reduceOnly param would be rejected
+    else: p["reduceOnly"] = "true"
+    return _signed("/fapi/v1/algoOrder", p)
 
 def cancel_algo(sym, algo_id): return _signed("/fapi/v1/algoOrder", {"symbol": sym, "algoId": algo_id}, "DELETE")
 def algo_open_ids(sym):
@@ -1084,7 +1090,7 @@ def manage_squeeze(st):
                     cur = pos.get("tr_stop") if pos.get("tr_oid") else None   # trust tr_stop ONLY if an order actually rests (A2: a failed placement no longer poisons the throttle)
                     if cur is None or abs(tstop - cur) / cur >= SQF_TRAIL_REPLACE_BP:
                         if pos.get("tr_oid"): cancel_algo(sym, pos["tr_oid"]); pos["tr_oid"] = None
-                        rt = stop_market_buy(sym, tstop)                 # catastrophe stop still resting -> replace gap covered
+                        rt = stop_market_buy_rq(sym, pos["qty"], tstop)  # FIX-A3: qty-based (coexists with the catastrophe closePosition stop)
                         if isinstance(rt, dict) and not rt.get("_error") and rt.get("algoId"):
                             pos["tr_oid"] = rt.get("algoId"); pos["tr_stop"] = tstop
                         elif px >= tstop:                                # rejected AND price already past the trigger (the 09:51 BANK case:

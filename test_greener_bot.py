@@ -1095,12 +1095,12 @@ c.LIVE = _svt["live"]; c.price_now = _svt["pn"]; c.live_positions = _svt["lp"]
 
 print("\n=== FIX-A (22-07): NATIVE trail stop — placed on arm, ratcheted throttled, tags exits correctly ===")
 _svn = dict(nat=c.SQF_TRAIL_NATIVE, act=c.SQF_TRAIL_ACT, live=c.LIVE, pn=c.price_now, lp=c.live_positions,
-            sm=c.stop_market_buy, cg=c.cancel_algo, sp=c.specs, ao=c.algo_open_ids, mb=c.mkt_buy_close, rc=c.real_close_fill)
+            sm=c.stop_market_buy, smr=c.stop_market_buy_rq, cg=c.cancel_algo, sp=c.specs, ao=c.algo_open_ids, mb=c.mkt_buy_close, rc=c.real_close_fill)
 c.LIVE = True; c.SQF_TRAIL_NATIVE = True; c.SQF_TRAIL_ACT = 0.003
 c.specs = lambda s: {"tick": 0.0001, "pp": 4, "step": 0.1, "qp": 1, "minq": 0.1, "minn": 5.0}
 c.live_positions = lambda: {("NTUSDT", "SHORT"): -10.0}
-_nc = {"place": [], "cancel": []}
-c.stop_market_buy = lambda sym, trig: (_nc["place"].append(round(trig, 4)), {"algoId": 500 + len(_nc["place"])})[1]
+_nc = {"place": [], "cancel": [], "qty": []}
+c.stop_market_buy_rq = lambda sym, qty, trig: (_nc["place"].append(round(trig, 4)), _nc["qty"].append(qty), {"algoId": 500 + len(_nc["place"])})[2]
 c.cancel_algo = lambda sym, aid: _nc["cancel"].append(aid)
 c.mkt_buy_close = lambda sym, qty: {"orderId": 1}
 c.real_close_fill = lambda sym, side, ts: None
@@ -1114,8 +1114,9 @@ s1 = _tst(_npos()); s1["squeeze"] = [s1["squeeze"][0]] if s1["squeeze"] else []
 s1 = {"long": [], "short": [], "mom": [], "snap": [], "trend": [], "squeeze": [_npos()], "wins": 0, "losses": 0,
       "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}, "fade_streak": 0}
 c.manage_squeeze(s1)
-ok(len(_nc["place"]) == 1 and abs(_nc["place"][0] - 99.7985) < 0.01 and s1["squeeze"][0].get("tr_oid") == 501,
-   "FIX-A: on arm, a NATIVE stop rests at minlow*(1+early) and its algoId is tracked")
+ok(len(_nc["place"]) == 1 and abs(_nc["place"][0] - 99.7985) < 0.01 and s1["squeeze"][0].get("tr_oid") == 501
+   and _nc["qty"] and abs(_nc["qty"][0] - 10.0) < 1e-9,
+   "FIX-A3: on arm, the trail rests via the QTY-based helper (coexists with the catastrophe closePosition stop)")
 # 2) ratchet: big improvement -> cancel+replace; tiny improvement -> throttled (no replace)
 c.price_now = lambda s: 99.0                                   # new minlow 99.0 -> stop 99.297 (move ~0.5% > 5bp)
 c.manage_squeeze(s1)
@@ -1149,12 +1150,12 @@ c.price_now = lambda s: 99.5
 c.manage_squeeze(s5)
 ok(len(_nc["place"]) == 0, "FIX-A: paper mode places no native stops (software trail only)")
 c.SQF_TRAIL_NATIVE = _svn["nat"]; c.SQF_TRAIL_ACT = _svn["act"]; c.LIVE = _svn["live"]; c.price_now = _svn["pn"]
-c.live_positions = _svn["lp"]; c.stop_market_buy = _svn["sm"]; c.cancel_algo = _svn["cg"]; c.specs = _svn["sp"]
+c.live_positions = _svn["lp"]; c.stop_market_buy = _svn["sm"]; c.stop_market_buy_rq = _svn["smr"]; c.cancel_algo = _svn["cg"]; c.specs = _svn["sp"]
 c.algo_open_ids = _svn["ao"]; c.mkt_buy_close = _svn["mb"]; c.real_close_fill = _svn["rc"]
 
 print("\n=== FIX-A2 (22-07): armed => trail rests OR position closes NOW ===")
 _sva2 = dict(nat=c.SQF_TRAIL_NATIVE, act=c.SQF_TRAIL_ACT, live=c.LIVE, pn=c.price_now, lp=c.live_positions,
-             sm=c.stop_market_buy, cg=c.cancel_algo, sp=c.specs, mb=c.mkt_buy_close, rc=c.real_close_fill, ao=c.algo_open_ids)
+             sm=c.stop_market_buy_rq, cg=c.cancel_algo, sp=c.specs, mb=c.mkt_buy_close, rc=c.real_close_fill, ao=c.algo_open_ids)
 c.LIVE = True; c.SQF_TRAIL_NATIVE = True; c.SQF_TRAIL_ACT = 0.003
 c.specs = lambda s: {"tick": 0.0001, "pp": 4, "step": 0.1, "qp": 1, "minq": 0.1, "minn": 5.0}
 c.live_positions = lambda: {("A2USDT", "SHORT"): -10.0}
@@ -1169,17 +1170,17 @@ def _a2st(pos):
     return {"long": [], "short": [], "mom": [], "snap": [], "trend": [], "squeeze": [pos], "wins": 0, "losses": 0,
             "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}, "fade_streak": 0}
 # 1) THE BANK CASE: placement rejected AND px already past the trigger -> close NOW at market (same tick)
-c.stop_market_buy = lambda sym, trig: {"_error": True, "_body": "would immediately trigger"}
+c.stop_market_buy_rq = lambda sym, qty, trig: {"_error": True, "_body": "would immediately trigger"}
 c.price_now = lambda s: 99.95                                   # trail stop = 99.5*1.003=99.7985; px 99.95 past it
 sA = _a2st(_a2pos())
 c.manage_squeeze(sA)
 ok(len(sA["squeeze"]) == 0, "A2: reject + px past trigger -> position CLOSED the same tick (no blind window)")
 # 2) transient reject with px still favorable -> keep position, tr_stop NOT persisted -> retries next tick
 _a2n = {"n": 0}
-def _sm_fail_then_ok(sym, trig):
+def _sm_fail_then_ok(sym, qty, trig):
     _a2n["n"] += 1
     return {"_error": True, "_body": "transient"} if _a2n["n"] == 1 else {"algoId": 606}
-c.stop_market_buy = _sm_fail_then_ok
+c.stop_market_buy_rq = _sm_fail_then_ok
 c.price_now = lambda s: 99.6                                    # BELOW the trail stop 99.7985 -> favorable, no close
 sB = _a2st(_a2pos())
 c.manage_squeeze(sB)
@@ -1188,7 +1189,7 @@ ok(len(sB["squeeze"]) == 1 and sB["squeeze"][0].get("tr_oid") is None,
 c.manage_squeeze(sB)                                            # next tick: placement retried -> succeeds
 ok(sB["squeeze"][0].get("tr_oid") == 606, "A2: placement RETRIED next tick and the trail now rests (no silent give-up)")
 c.SQF_TRAIL_NATIVE = _sva2["nat"]; c.SQF_TRAIL_ACT = _sva2["act"]; c.LIVE = _sva2["live"]; c.price_now = _sva2["pn"]
-c.live_positions = _sva2["lp"]; c.stop_market_buy = _sva2["sm"]; c.cancel_algo = _sva2["cg"]; c.specs = _sva2["sp"]
+c.live_positions = _sva2["lp"]; c.stop_market_buy_rq = _sva2["sm"]; c.cancel_algo = _sva2["cg"]; c.specs = _sva2["sp"]
 c.mkt_buy_close = _sva2["mb"]; c.real_close_fill = _sva2["rc"]; c.algo_open_ids = _sva2["ao"]
 
 print(f"\n{'='*40}\n{P} passed, {F} failed")
