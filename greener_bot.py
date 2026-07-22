@@ -1080,14 +1080,18 @@ def manage_squeeze(st):
                 w = SQF_TRAIL_EARLY if (now() - pos["fill_ts"]) < SQF_TRAIL_EARLY_MIN * 60 else SQF_TRAIL
                 sp_t = specs(sym)
                 tstop = round_tick(pos["minlow"] * (1 + w), sp_t) if sp_t else pos["minlow"] * (1 + w)
-                if LIVE and SQF_TRAIL_NATIVE:                            # FIX-A: rest a REAL stop at the trail level (no 2s-poll overshoot)
-                    cur = pos.get("tr_stop")
-                    if cur is None or abs(tstop - cur) / cur >= SQF_TRAIL_REPLACE_BP:   # throttle: replace on >=5bp moves only
-                        if pos.get("tr_oid"): cancel_algo(sym, pos["tr_oid"])           # catastrophe stop still resting -> gap covered
-                        rt = stop_market_buy(sym, tstop)
-                        pos["tr_oid"] = rt.get("algoId") if isinstance(rt, dict) and not rt.get("_error") else None
-                        pos["tr_stop"] = tstop
-                if px >= tstop: tag = "TRAIL"                            # software fallback (paper mode / native-miss belt)
+                if LIVE and SQF_TRAIL_NATIVE:                            # FIX-A2 (Artem): armed => the trail RESTS on the exchange OR we are out. Now.
+                    cur = pos.get("tr_stop") if pos.get("tr_oid") else None   # trust tr_stop ONLY if an order actually rests (A2: a failed placement no longer poisons the throttle)
+                    if cur is None or abs(tstop - cur) / cur >= SQF_TRAIL_REPLACE_BP:
+                        if pos.get("tr_oid"): cancel_algo(sym, pos["tr_oid"]); pos["tr_oid"] = None
+                        rt = stop_market_buy(sym, tstop)                 # catastrophe stop still resting -> replace gap covered
+                        if isinstance(rt, dict) and not rt.get("_error") and rt.get("algoId"):
+                            pos["tr_oid"] = rt.get("algoId"); pos["tr_stop"] = tstop
+                        elif px >= tstop:                                # rejected AND price already past the trigger (the 09:51 BANK case:
+                            tag = "TRAIL"                                # bounce beat the placement) -> the trail HAS fired; close NOW at market
+                            log(f"SQF-TRAIL-INSTANT {sym}: placement rejected with px past the trigger — closing NOW")
+                        # else: transient reject with px still favorable -> tr_oid stays None -> RETRY next 2s tick
+                if tag is None and px >= tstop: tag = "TRAIL"            # software fallback (paper mode / native-miss belt)
         if LIVE and tag is None and amt < pos["qty"] * 0.5:
             # position gone from the exchange: the NATIVE TRAIL stop, the catastrophe stop, OR a manual close/ADL.
             # Distinguish by which algo vanished — only real stops feed the counters; manual flatten books "closed".

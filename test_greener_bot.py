@@ -1152,5 +1152,44 @@ c.SQF_TRAIL_NATIVE = _svn["nat"]; c.SQF_TRAIL_ACT = _svn["act"]; c.LIVE = _svn["
 c.live_positions = _svn["lp"]; c.stop_market_buy = _svn["sm"]; c.cancel_algo = _svn["cg"]; c.specs = _svn["sp"]
 c.algo_open_ids = _svn["ao"]; c.mkt_buy_close = _svn["mb"]; c.real_close_fill = _svn["rc"]
 
+print("\n=== FIX-A2 (22-07): armed => trail rests OR position closes NOW ===")
+_sva2 = dict(nat=c.SQF_TRAIL_NATIVE, act=c.SQF_TRAIL_ACT, live=c.LIVE, pn=c.price_now, lp=c.live_positions,
+             sm=c.stop_market_buy, cg=c.cancel_algo, sp=c.specs, mb=c.mkt_buy_close, rc=c.real_close_fill, ao=c.algo_open_ids)
+c.LIVE = True; c.SQF_TRAIL_NATIVE = True; c.SQF_TRAIL_ACT = 0.003
+c.specs = lambda s: {"tick": 0.0001, "pp": 4, "step": 0.1, "qp": 1, "minq": 0.1, "minn": 5.0}
+c.live_positions = lambda: {("A2USDT", "SHORT"): -10.0}
+c.cancel_algo = lambda sym, aid: None
+c.mkt_buy_close = lambda sym, qty: {"orderId": 1}
+c.real_close_fill = lambda sym, side, ts: None
+def _a2pos(**kw):
+    p = {"coin": "A2USDT", "state": "OPEN", "entry": 100.0, "qty": 10.0, "stop": 102.5, "sl_oid": 999,
+         "ts": c.now(), "fill_ts": c.now() - 60, "maxadv": 100.0, "minlow": 99.5, "sq_armed": True}
+    p.update(kw); return p
+def _a2st(pos):
+    return {"long": [], "short": [], "mom": [], "snap": [], "trend": [], "squeeze": [pos], "wins": 0, "losses": 0,
+            "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}, "fade_streak": 0}
+# 1) THE BANK CASE: placement rejected AND px already past the trigger -> close NOW at market (same tick)
+c.stop_market_buy = lambda sym, trig: {"_error": True, "_body": "would immediately trigger"}
+c.price_now = lambda s: 99.95                                   # trail stop = 99.5*1.003=99.7985; px 99.95 past it
+sA = _a2st(_a2pos())
+c.manage_squeeze(sA)
+ok(len(sA["squeeze"]) == 0, "A2: reject + px past trigger -> position CLOSED the same tick (no blind window)")
+# 2) transient reject with px still favorable -> keep position, tr_stop NOT persisted -> retries next tick
+_a2n = {"n": 0}
+def _sm_fail_then_ok(sym, trig):
+    _a2n["n"] += 1
+    return {"_error": True, "_body": "transient"} if _a2n["n"] == 1 else {"algoId": 606}
+c.stop_market_buy = _sm_fail_then_ok
+c.price_now = lambda s: 99.6                                    # BELOW the trail stop 99.7985 -> favorable, no close
+sB = _a2st(_a2pos())
+c.manage_squeeze(sB)
+ok(len(sB["squeeze"]) == 1 and sB["squeeze"][0].get("tr_oid") is None,
+   "A2: transient reject with px favorable -> position kept, no fake tr_stop persisted")
+c.manage_squeeze(sB)                                            # next tick: placement retried -> succeeds
+ok(sB["squeeze"][0].get("tr_oid") == 606, "A2: placement RETRIED next tick and the trail now rests (no silent give-up)")
+c.SQF_TRAIL_NATIVE = _sva2["nat"]; c.SQF_TRAIL_ACT = _sva2["act"]; c.LIVE = _sva2["live"]; c.price_now = _sva2["pn"]
+c.live_positions = _sva2["lp"]; c.stop_market_buy = _sva2["sm"]; c.cancel_algo = _sva2["cg"]; c.specs = _sva2["sp"]
+c.mkt_buy_close = _sva2["mb"]; c.real_close_fill = _sva2["rc"]; c.algo_open_ids = _sva2["ao"]
+
 print(f"\n{'='*40}\n{P} passed, {F} failed")
 sys.exit(1 if F else 0)
