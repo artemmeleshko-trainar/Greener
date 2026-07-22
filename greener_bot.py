@@ -260,6 +260,12 @@ SQF_TRAIL_EARLY_MIN = int(os.environ.get("SQF_TRAIL_EARLY_MIN", "10"))
 # stays resting the whole time (covers the cancel->place gap); the software poll remains as a belt-and-braces fallback.
 SQF_TRAIL_NATIVE     = os.environ.get("SQF_TRAIL_NATIVE", "1") not in ("0", "false", "False", "no")
 SQF_TRAIL_REPLACE_BP = float(os.environ.get("SQF_TRAIL_REPLACE_BP", "0.0005"))   # min stop move (frac) to justify cancel/replace
+# BE-FLOOR (22-07, Artem: "після зелені — ніколи в червоне"): once ARMED, the trail stop may never sit above
+# entry*(1-SQF_TRAIL_BE) — shallow-green bounces exit ~breakeven instead of locking a red (the UNI case: peak +0.42%
+# with base width 0.75% put the stop ABOVE entry -> -$0.20). Deep moves are untouched (the ratcheted trail level goes
+# below the floor and takes over). Cost, stated honestly: green->wiggle-above-entry->THEN-run trades (PUMP-class) get
+# cut ~flat. 0 = OFF (byte-identical).
+SQF_TRAIL_BE = float(os.environ.get("SQF_TRAIL_BE", "0"))
 
 # ========================= MOMENTUM LEG (v4 config A "Drive") — ported from momentum_engine.py =========================
 # THIRD strategy merged into the shared pool: LONG-ONLY multi-setup momentum on a MOVERS universe (full perp pool ranked
@@ -1086,6 +1092,9 @@ def manage_squeeze(st):
                 w = SQF_TRAIL_EARLY if (now() - pos["fill_ts"]) < SQF_TRAIL_EARLY_MIN * 60 else SQF_TRAIL
                 sp_t = specs(sym)
                 tstop = round_tick(pos["minlow"] * (1 + w), sp_t) if sp_t else pos["minlow"] * (1 + w)
+                if SQF_TRAIL_BE > 0:                                     # BE-FLOOR: armed => never lock worse than ~breakeven
+                    be_px = round_tick(pos["entry"] * (1 - SQF_TRAIL_BE), sp_t) if sp_t else pos["entry"] * (1 - SQF_TRAIL_BE)
+                    tstop = min(tstop, be_px)
                 if LIVE and SQF_TRAIL_NATIVE:                            # FIX-A2 (Artem): armed => the trail RESTS on the exchange OR we are out. Now.
                     cur = pos.get("tr_stop") if pos.get("tr_oid") else None   # trust tr_stop ONLY if an order actually rests (A2: a failed placement no longer poisons the throttle)
                     if cur is None or abs(tstop - cur) / cur >= SQF_TRAIL_REPLACE_BP:
@@ -1093,6 +1102,7 @@ def manage_squeeze(st):
                         rt = stop_market_buy_rq(sym, pos["qty"], tstop)  # FIX-A3: qty-based (coexists with the catastrophe closePosition stop)
                         if isinstance(rt, dict) and not rt.get("_error") and rt.get("algoId"):
                             pos["tr_oid"] = rt.get("algoId"); pos["tr_stop"] = tstop
+                            log(f"SQF-TRAIL-SET {sym} @ {fmt(tstop)} — resting on the exchange")
                         elif px >= tstop:                                # rejected AND price already past the trigger (the 09:51 BANK case:
                             tag = "TRAIL"                                # bounce beat the placement) -> the trail HAS fired; close NOW at market
                             log(f"SQF-TRAIL-INSTANT {sym}: placement rejected with px past the trigger — closing NOW")

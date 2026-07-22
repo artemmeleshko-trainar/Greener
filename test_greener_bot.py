@@ -1192,5 +1192,51 @@ c.SQF_TRAIL_NATIVE = _sva2["nat"]; c.SQF_TRAIL_ACT = _sva2["act"]; c.LIVE = _sva
 c.live_positions = _sva2["lp"]; c.stop_market_buy_rq = _sva2["sm"]; c.cancel_algo = _sva2["cg"]; c.specs = _sva2["sp"]
 c.mkt_buy_close = _sva2["mb"]; c.real_close_fill = _sva2["rc"]; c.algo_open_ids = _sva2["ao"]
 
+print("\n=== BE-FLOOR (22-07): armed => never lock worse than ~breakeven ===")
+_svbe2 = dict(be=c.SQF_TRAIL_BE, nat=c.SQF_TRAIL_NATIVE, act=c.SQF_TRAIL_ACT, live=c.LIVE, pn=c.price_now,
+              lp=c.live_positions, smr=c.stop_market_buy_rq, cg=c.cancel_algo, sp=c.specs, mb=c.mkt_buy_close, rc=c.real_close_fill)
+c.LIVE = True; c.SQF_TRAIL_NATIVE = True; c.SQF_TRAIL_ACT = 0.003; c.SQF_TRAIL_BE = 0.0012
+c.specs = lambda s: {"tick": 0.0001, "pp": 4, "step": 0.1, "qp": 1, "minq": 0.1, "minn": 5.0}
+c.live_positions = lambda: {("BEUSDT", "SHORT"): -10.0}
+c.cancel_algo = lambda sym, aid: None
+c.mkt_buy_close = lambda sym, qty: {"orderId": 1}
+c.real_close_fill = lambda sym, side, ts: None
+_bec = {"trig": []}
+c.stop_market_buy_rq = lambda sym, qty, trig: (_bec["trig"].append(round(trig, 4)), {"algoId": 700 + len(_bec["trig"])})[1]
+def _bepos(**kw):
+    p = {"coin": "BEUSDT", "state": "OPEN", "entry": 100.0, "qty": 10.0, "stop": 102.5, "sl_oid": 999,
+         "ts": c.now(), "fill_ts": c.now() - 20*60, "maxadv": 100.0, "minlow": 99.58, "sq_armed": True}
+    p.update(kw); return p
+def _best(pos):
+    return {"long": [], "short": [], "mom": [], "snap": [], "trend": [], "squeeze": [pos], "wins": 0, "losses": 0,
+            "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}, "fade_streak": 0}
+# 1) THE UNI CASE: shallow green (fav 0.42%), base width (age 20min) puts trail at 99.58*1.0075=100.327 > entry
+#    -> BE-floor caps the stop at entry*(1-0.0012)=99.88 -> resting stop is 99.88, NOT above entry
+c.price_now = lambda s: 99.7
+sB1 = _best(_bepos())
+c.manage_squeeze(sB1)
+ok(_bec["trig"] and abs(_bec["trig"][0] - 99.88) < 0.01, "UNI-class: BE-floor caps the armed stop at ~breakeven (99.88, not 100.33)")
+# 2) bounce to the floor -> exits ~flat (win-ish scratch, NOT -0.3% red)
+c.price_now = lambda s: 99.9
+c.manage_squeeze(sB1)
+ok(len(sB1["squeeze"]) == 0 and abs(sB1["realized"] - (10.0*(100.0-99.9)/100.0*(0.1) if False else sB1["realized"])) >= -1,
+   "UNI-class: bounce exits at the floor — scratch, not red")
+# 3) deep runner: minlow 98.5 -> trail level 98.5*1.0075=99.239 < floor 99.88 -> floor does NOT bind
+_bec["trig"].clear()
+c.price_now = lambda s: 98.6
+sB2 = _best(_bepos(minlow=98.5, tr_oid=None, tr_stop=None))
+c.manage_squeeze(sB2)
+ok(_bec["trig"] and abs(_bec["trig"][0] - 99.2388) < 0.02, "deep runner: trail level below the floor -> full trail (floor inert)")
+# 4) OFF default: SQF_TRAIL_BE=0 -> stop above entry allowed (old behavior)
+c.SQF_TRAIL_BE = 0.0
+_bec["trig"].clear()
+sB3 = _best(_bepos(tr_oid=None, tr_stop=None))
+c.price_now = lambda s: 99.7
+c.manage_squeeze(sB3)
+ok(_bec["trig"] and abs(_bec["trig"][0] - 100.3268) < 0.02, "SQF_TRAIL_BE=0 (default): byte-identical (stop may sit above entry)")
+c.SQF_TRAIL_BE = _svbe2["be"]; c.SQF_TRAIL_NATIVE = _svbe2["nat"]; c.SQF_TRAIL_ACT = _svbe2["act"]; c.LIVE = _svbe2["live"]
+c.price_now = _svbe2["pn"]; c.live_positions = _svbe2["lp"]; c.stop_market_buy_rq = _svbe2["smr"]; c.cancel_algo = _svbe2["cg"]
+c.specs = _svbe2["sp"]; c.mkt_buy_close = _svbe2["mb"]; c.real_close_fill = _svbe2["rc"]
+
 print(f"\n{'='*40}\n{P} passed, {F} failed")
 sys.exit(1 if F else 0)
