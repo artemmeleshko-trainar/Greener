@@ -242,6 +242,13 @@ SQF_SL            = float(os.environ.get("SQF_SL", "0.04"))         # catastroph
 SQF_CAP           = int(os.environ.get("SQF_CAP", "0"))             # max concurrent squeeze-fades. 0 = engine takes no slots.
 SQF_COOLDOWN_MIN  = int(os.environ.get("SQF_COOLDOWN_MIN", "60"))   # one squeeze-fade per coin per this many minutes
 SQF_SCAN_MAX      = int(os.environ.get("SQF_SCAN_MAX", "12"))       # liq-call burst cap per 1m scan (top pumps first) — Coinalyze free tier safety
+# ===== E5 MAKER-ENTRY HYBRID (22-07 variation study + 2 audits): limit SELL above market instead of instant taker.
+# Better entry + maker fee, worth ~+$0.05-0.13/trade under BOTH fill rules; adverse selection is real (the ~9-18% signals
+# that never reach the limit are ~90%-WR instant reversals) but net of skipped winners the hybrid still wins, and the
+# taker FALLBACK on TTL keeps every trade (execution improvement, not a signal change). SQF_MAKER=0 (default) = byte-identical.
+SQF_MAKER         = os.environ.get("SQF_MAKER", "0") not in ("0", "false", "False", "no")
+SQF_MAKER_BUMP    = float(os.environ.get("SQF_MAKER_BUMP", "0.003"))   # limit at signal px * (1+this)
+SQF_MAKER_TTL_SEC = int(os.environ.get("SQF_MAKER_TTL_SEC", "300"))    # unfilled after this -> cancel (race-safe) + taker market fallback
 # ===== E5 TRAIL (22-07, Artem's order, tuned on the 12 real night paths — grid + corrected sim, fill-bar contamination excluded):
 # arm the trail the moment favorable excursion reaches SQF_TRAIL_ACT (all 12 night trades were green >=0.3% early — Artem's thesis,
 # verified); width is TWO-PHASE: tight SQF_TRAIL_EARLY for the first SQF_TRAIL_EARLY_MIN minutes (banks instant spikes — Artem's
@@ -971,8 +978,9 @@ def _close_snap(st, pos, px, tag):
 # NO TP / NO trail. Port deltas vs clever-bot: U1/ledger/allocator stripped; PUMP CHECK FIRST (free klines) so the
 # Coinalyze call runs only for already-pumping coins (rate-limit: ~0-10 liq calls/min vs a 150-coin sweep's 429s).
 _SQ_COOLDOWN = {}
-def squeeze_liq(sym):
+def squeeze_liq(sym, buckets=False):
     """(S5, S15, L15) = short-liq $ summed over last 5/15 min + long-liq over 15, Coinalyze 1min bars.
+    buckets=True appends the raw per-minute short-liq list (ARM telemetry: liq-shape features).
     None on ANY failure/no key -> the engine SELF-IDLES (absence of data here IS 'no signal')."""
     if not COINALYZE_KEY: return None
     try:
@@ -983,11 +991,29 @@ def squeeze_liq(sym):
         d = json.loads(urllib.request.urlopen(req, timeout=4).read())
         if not (isinstance(d, list) and d): return None
         hist = d[0].get("history", [])
-        if not hist: return (0.0, 0.0, 0.0)
+        if not hist: return (0.0, 0.0, 0.0, []) if buckets else (0.0, 0.0, 0.0)
         s = [float(h.get("s", 0) or 0) for h in hist]; l = [float(h.get("l", 0) or 0) for h in hist]
+        if buckets: return (sum(s[-5:]), sum(s[-15:]), sum(l[-15:]), s)
         return (sum(s[-5:]), sum(s[-15:]), sum(l[-15:]))
     except Exception:
         return None
+
+def _sq_shape(sbk):
+    """(s1max_s5, m1_share) from the per-minute short-liq buckets. CLOSED minutes only — the last bucket is the forming
+    minute, mostly post-decision (the fill-bar trap's liq cousin). Pure ARM telemetry for the pre-registered entry
+    filters from the 22-07 study (skip if s1max_s5<0.6 etc.) — logged, never gating."""
+    sc = sbk[:-1] if len(sbk) > 1 else []
+    s5c = sum(sc[-5:])
+    if s5c <= 0: return 0.0, 0.0
+    return max(sc[-5:]) / s5c, sc[-1] / s5c
+
+def pump60(sym):
+    """Pct change over the prior 60 CLOSED 1m bars (ARM telemetry only, not a gate)."""
+    k = mkl(sym, "1m", 63)
+    if not k or len(k) < 62: return None
+    k = k[:-1]
+    c = [float(x[4]) for x in k]
+    return (c[-1] / c[-61] - 1) * 100
 
 def pump15(sym):
     """Pct change over the prior 15 CLOSED 1m bars. None on failure. (Forming bar dropped — closed candles only.)"""
@@ -1033,18 +1059,37 @@ def open_squeeze(st, watch):
     cands = sorted(((pm, s) for s, pm in zip(elig, pumps) if pm is not None and pm >= SQF_PUMP_MIN), reverse=True)
     for pm, sym in cands[:SQF_SCAN_MAX]:
         if not can_open(st, "squeeze"): break
-        ls = squeeze_liq(sym)
+        ls = squeeze_liq(sym, buckets=True)
         if ls is None: continue
-        S5, S15, L15 = ls
+        S5, S15, L15, sbk = ls
         if S5 < SQF_S5_MIN or not (S15 > SQF_DOM * L15): continue
         px = price_now(sym)
         if px is None: continue
+        s1x, m1s = _sq_shape(sbk)                       # ARM telemetry (22-07 study): one-shot-ness + still-flowing share
+        p60 = pump60(sym)                               # ARM telemetry: 60-min pump (ceiling ideas died, floor ideas live)
         sig = {"px": px, "S5": S5, "S15": S15, "L15": L15, "pm15": pm}
         entry = sig["px"]; sp = specs(sym)
         if not sp: continue
         qty, sp = calc_qty(sym, entry, margin * LEV * E_SIZE_FRAC)
         if not qty: continue
-        log(f"SQF-ARM {sym}: squeeze SELL {qty} @ {fmt(entry)} S5 ${sig['S5']:,.0f} S15/L15 ${sig['S15']:,.0f}/${sig['L15']:,.0f} pump{sig['pm15']:+.1f}%")
+        log(f"SQF-ARM {sym}: squeeze SELL {qty} @ {fmt(entry)} S5 ${sig['S5']:,.0f} S15/L15 ${sig['S15']:,.0f}/${sig['L15']:,.0f} "
+            f"pump{sig['pm15']:+.1f}% s1x{s1x:.2f} m1{m1s:.2f} p60{f'{p60:+.1f}' if p60 is not None else '?'}%")
+        if SQF_MAKER:                                    # MAKER-ENTRY HYBRID: limit SELL above market, taker fallback on TTL
+            lpx = round_tick(entry * (1 + SQF_MAKER_BUMP), sp)
+            oid = None
+            if LIVE:
+                set_lev(sym)
+                r = limit_short_open(sym, qty, lpx)
+                oid = r.get("orderId") if isinstance(r, dict) and not r.get("_error") else None
+                if not oid: log(f"SQF-MAKER-REJECT {sym}: {str(r)[:80]} — falling back to taker NOW")
+            if oid or not LIVE:
+                st["squeeze"].append({"coin": sym, "state": "PENDING", "oid": oid, "limit": lpx, "qty": qty, "ts": now(),
+                                      "s1x": s1x, "m1s": m1s, "p60": p60, "S5": S5, "pm15": pm})
+                open_syms.add(sym); _SQ_COOLDOWN[sym] = now(); took_slot(st, "squeeze")
+                log(f"SQF-PEND {sym}: maker SELL {qty} @ {fmt(lpx)} (+{SQF_MAKER_BUMP*100:.1f}%) TTL {SQF_MAKER_TTL_SEC//60}m | "
+                    f"{n_open(st)}/{TOTAL_SLOTS}")
+                continue
+            # LIVE limit placement rejected -> fall through to the immediate-taker path (the hybrid's own fallback)
         if LIVE:
             set_lev(sym); r = market_short(sym, qty)
             if not (isinstance(r, dict) and not r.get("_error")):
@@ -1070,12 +1115,70 @@ def open_squeeze(st, watch):
             f"{n_open(st)}/{TOTAL_SLOTS} (L{len(st['long'])}/S{len(st['short'])}/SQ{len(st['squeeze'])})")
         _tg(f"🟣🔔 <b>SQF-FILL {sym}</b> squeeze SELL @ {fmt(entry)} | SL +{SQF_SL*100:.0f}% | hold {SQF_HOLD_MIN}m | S5 ${sig['S5']:,.0f} pump {sig['pm15']:+.1f}%")
 
+def _sq_promote(st, pos, entry, qty):
+    """PENDING maker entry (or its taker fallback) FILLED -> real squeeze position with the catastrophe stop. Never naked."""
+    sym = pos["coin"]; sp = specs(sym)
+    sl_px = round_tick(entry * (1 + SQF_SL), sp) if sp else entry * (1 + SQF_SL)
+    sl_oid = None
+    if LIVE:
+        r2 = stop_market_buy(sym, sl_px)
+        sl_oid = r2.get("algoId") if isinstance(r2, dict) and not r2.get("_error") else None
+    pos.update({"state": "OPEN", "oid": None, "entry": entry, "qty": qty, "stop": sl_px, "sl_oid": sl_oid,
+                "ts": now(), "fill_ts": now(), "maxadv": entry, "minlow": entry})
+    log(f"SQF-FILL {sym} @ {fmt(entry)} SL {fmt(sl_px)} (+{SQF_SL*100:.0f}%) hold {SQF_HOLD_MIN}m [SQUEEZE OPEN] | "
+        f"{n_open(st)}/{TOTAL_SLOTS} (L{len(st['long'])}/S{len(st['short'])}/SQ{len(st['squeeze'])})")
+    _tg(f"🟣🔔 <b>SQF-FILL {sym}</b> squeeze SELL @ {fmt(entry)} (maker-hybrid) | SL +{SQF_SL*100:.0f}% | hold {SQF_HOLD_MIN}m")
+
+def _sq_pending_tick(st, pos):
+    """Maker-hybrid PENDING each 2s tick: fill -> promote; partial -> cancel remainder race-safely then promote at
+    executedQty; TTL expiry -> cancel (race-safe) then taker fallback. Copies the fade leg's ORPHAN-FIX and
+    fill-on-cancel patterns verbatim (the 20-07 ONDO/MET incident class). A rejected/zero-fill fallback frees the
+    slot — never a phantom position (AUDIT BUG-3 pattern)."""
+    sym = pos["coin"]
+    if LIVE:
+        stt = order_status(sym, pos["oid"]); s = stt.get("status") if isinstance(stt, dict) else None
+        exq = float(stt.get("executedQty", 0) or 0) if isinstance(stt, dict) else 0.0
+        if s in ("FILLED", "PARTIALLY_FILLED") and exq > 0:
+            if s == "PARTIALLY_FILLED":                   # ORPHAN-FIX: kill the unfilled remainder NOW (race-safe re-query)
+                cancel(sym, pos["oid"])
+                stt2 = order_status(sym, pos["oid"])
+                if isinstance(stt2, dict) and float(stt2.get("executedQty", 0) or 0) > 0: stt = stt2
+            _sq_promote(st, pos, float(stt.get("avgPrice") or pos["limit"]), float(stt["executedQty"])); return
+        if s in ("CANCELED", "EXPIRED", "REJECTED"):
+            if exq > 0:                                   # AUDIT BUG-1 class: cancelled but FILLED first -> open WITH SL
+                log(f"SQF-FILL-ON-CANCEL {sym}: executedQty={exq} — opening WITH SL")
+                _sq_promote(st, pos, float(stt.get("avgPrice") or pos["limit"]), exq); return
+            st["squeeze"].remove(pos); log(f"SQF-PEND-GONE {sym}: order {s}, nothing filled — slot freed"); return
+        if now() - pos["ts"] >= SQF_MAKER_TTL_SEC:        # TTL: cancel, re-query the fill race, else taker fallback
+            cancel(sym, pos["oid"])
+            stt3 = order_status(sym, pos["oid"])
+            if isinstance(stt3, dict) and float(stt3.get("executedQty", 0) or 0) > 0:
+                _sq_promote(st, pos, float(stt3.get("avgPrice") or pos["limit"]), float(stt3["executedQty"])); return
+            r = market_short(sym, pos["qty"])             # taker fallback — the hybrid never skips the trade
+            if not (isinstance(r, dict) and not r.get("_error")):
+                st["squeeze"].remove(pos); log(f"SQF-PEND-FALLBACK-REJECT {sym}: {str(r)[:80]} — slot freed"); return
+            exq2 = float(r.get("executedQty", 0) or 0)
+            if exq2 <= 0 and r.get("orderId"):            # AUDIT BUG-3: one re-query — no phantom positions
+                stq = order_status(sym, r["orderId"])
+                if isinstance(stq, dict): exq2 = float(stq.get("executedQty", 0) or 0); r = stq if exq2 > 0 else r
+            if exq2 <= 0:
+                st["squeeze"].remove(pos); log(f"SQF-PEND-NOFILL {sym}: fallback matched nothing — slot freed"); return
+            _sq_promote(st, pos, float(r.get("avgPrice") or pos["limit"]), exq2)
+        return                                            # still working the limit
+    px = price_now(sym)                                   # paper: fill when price trades up INTO the limit; TTL -> taker sim
+    if px is not None and px >= pos["limit"]: _sq_promote(st, pos, pos["limit"], pos["qty"]); return
+    if now() - pos["ts"] >= SQF_MAKER_TTL_SEC:
+        if px is None: st["squeeze"].remove(pos); return
+        _sq_promote(st, pos, px, pos["qty"])
+
 def manage_squeeze(st):
     """E5 exits: TIME (SQF_HOLD_MIN) or the wide catastrophe stop. Live also detects a native-stop close."""
     if not st.get("squeeze"): return
     realpos = live_positions() if LIVE else {}
     if realpos is None: return
     for pos in list(st["squeeze"]):
+        if pos.get("state") == "PENDING":                 # maker-hybrid entry still working its limit
+            _sq_pending_tick(st, pos); continue
         sym = pos["coin"]; px = price_now(sym)
         if px is None: continue
         pos["maxadv"] = max(pos.get("maxadv", pos["entry"]), px)
@@ -2177,7 +2280,7 @@ def main():
     log(f"GREENER BOT ({'🔴 LIVE' if LIVE else '📝 PAPER'}) start — eq ${st['equity']:.2f} | {TOTAL_SLOTS} slots "
         f"(dip≤{M_DIP_CAP}/fade≤{S_FADE_CAP}/sqf≤{SQF_CAP}/mom≤{M_MOM_CAP}/snap≤{SNAP_CAP}, 🔒total-long≤{M_TOTAL_LONG_CAP}) {LEV}x | "
         f"{'S1-LIQGATE@fill≥$'+format(GR_FILL_LIQ_MIN,',.0f') if GR_FILL_LIQ_MIN else 'S1-liqgate OFF'} | "
-        f"{'E5-SQF ON (S5≥$'+format(SQF_S5_MIN,',.0f')+' hold'+str(SQF_HOLD_MIN)+'m SL+'+format(SQF_SL*100,'.0f')+'%)' if SQF_ENABLED else 'E5-SQF off'} | "
+        f"{'E5-SQF ON (S5≥$'+format(SQF_S5_MIN,',.0f')+' pump≥'+format(SQF_PUMP_MIN,'.1f')+'% hold'+str(SQF_HOLD_MIN)+'m SL+'+format(SQF_SL*100,'.1f')+'%'+(' maker+'+format(SQF_MAKER_BUMP*100,'.1f')+'%/'+str(SQF_MAKER_TTL_SEC//60)+'m' if SQF_MAKER else '')+')' if SQF_ENABLED else 'E5-SQF off'} | "
         f"DIP=maker dip-buy (TP+{L_TP}% trail@{L_TRAIL_ACT*100:.1f}%/{L_TRAIL*100:.1f}%{' OI-HARD' if L_OI_CAPIT else (f' OI-SOFT{L_OI_CAPIT_SOFT}' if L_OI_CAPIT_SOFT else '')}) | "
         f"FADE={stfs} (R{S_R} {f'CHANDELIER{S_CHAND_K}xATR@{S_CHAND_ARM*100:.0f}%' if S_CHAND else f'trail@{S_TRAIL_ACT*100:.0f}%/{S_TRAIL*100:.1f}%'}{f' liq-gate≥${S_LIQ_MIN:.0f}' if S_LIQ_MIN else ''}) | {mband} | {aband} | {bband} | {dband} | {eband} | hedge={HEDGE}")
     if (GR_FILL_LIQ_MIN > 0 or SQF_ENABLED) and not COINALYZE_KEY:   # AUDIT BUG-7: a missing key silently kills BOTH short engines

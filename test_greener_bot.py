@@ -995,9 +995,10 @@ c.SQF_ENABLED = True; _svcap = c.SQF_CAP; c.SQF_CAP = 1
 c.set_lev = lambda s: None
 c.market_short = lambda sym, qty: {"orderId": 9100, "executedQty": "0"}
 c.order_status = lambda sym, oid: {"status": "EXPIRED", "executedQty": "0"}
-_svsq, _svpm = c.squeeze_liq, c.pump15
+_svsq, _svpm, _svp60 = c.squeeze_liq, c.pump15, c.pump60
 c.pump15 = lambda s: 2.0
-c.squeeze_liq = lambda s: (99999.0, 99999.0, 1.0)
+c.pump60 = lambda s: 3.0
+c.squeeze_liq = lambda s, buckets=False: (99999.0, 99999.0, 1.0, [0.0, 99999.0]) if buckets else (99999.0, 99999.0, 1.0)
 c.price_now = lambda s: 1.0
 stn = {"long": [], "short": [], "mom": [], "snap": [], "trend": [], "squeeze": [], "wins": 0, "losses": 0,
        "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}}
@@ -1033,7 +1034,7 @@ c.price_now = lambda s: 1.02
 c.manage_squeeze(stm)
 ok(len(stm["squeeze"]) == 0 and stm["fade_streak"] == 0 and "MANUSDT" not in stm["fade_sl_ts"],
    "LOW-1: manual flatten -> tag 'closed', breaker counters untouched")
-c.SQF_CAP = _svcap; c.squeeze_liq = _svsq; c.pump15 = _svpm
+c.SQF_CAP = _svcap; c.squeeze_liq = _svsq; c.pump15 = _svpm; c.pump60 = _svp60
 # BUG-4/5 wiring pins: every arm path uses held_all; reconcile enumerates squeeze
 import inspect
 for fn in (c.open_snapback, c.open_trend, c.open_momentum, c.open_long, c.open_short, c.open_squeeze):
@@ -1237,6 +1238,75 @@ ok(_bec["trig"] and abs(_bec["trig"][0] - 100.3268) < 0.02, "SQF_TRAIL_BE=0 (def
 c.SQF_TRAIL_BE = _svbe2["be"]; c.SQF_TRAIL_NATIVE = _svbe2["nat"]; c.SQF_TRAIL_ACT = _svbe2["act"]; c.LIVE = _svbe2["live"]
 c.price_now = _svbe2["pn"]; c.live_positions = _svbe2["lp"]; c.stop_market_buy_rq = _svbe2["smr"]; c.cancel_algo = _svbe2["cg"]
 c.specs = _svbe2["sp"]; c.mkt_buy_close = _svbe2["mb"]; c.real_close_fill = _svbe2["rc"]
+
+print("\n=== E5 MAKER-ENTRY HYBRID (22-07): PENDING lifecycle + shape telemetry ===")
+# _sq_shape math (closed buckets only; the forming minute is dropped)
+_s1x, _m1s = c._sq_shape([0.0, 0.0, 10000.0, 2000.0, 1000.0, 500.0])
+ok(abs(_s1x - 10000.0/13000.0) < 1e-9 and abs(_m1s - 1000.0/13000.0) < 1e-9,
+   "_sq_shape: forming minute dropped; s1max/m1 shares over the closed 5-min window")
+ok(c._sq_shape([5000.0]) == (0.0, 0.0), "_sq_shape: forming-only bucket list -> zeros, no crash")
+ok(c._sq_shape([0.0, 0.0]) == (0.0, 0.0), "_sq_shape: zero closed liq -> zeros (no div0)")
+ok(not c.SQF_MAKER, "SQF_MAKER default OFF (byte-identical without the env)")
+
+_svmk = dict(live=c.LIVE, mk=c.SQF_MAKER, os_=c.order_status, ca=c.cancel, ms=c.market_short, lp=c.live_positions,
+             smb=c.stop_market_buy, sp=c.specs, pn=c.price_now, tg=c._tg)
+c.SQF_MAKER = True; c._tg = lambda m: None
+c.specs = lambda s: {"step": 0.1, "minq": 0.1, "minn": 5.0, "tick": 0.0001, "qp": 1, "pp": 4}
+def _mkpend(**kw):
+    p = {"coin": "MKUSDT", "state": "PENDING", "oid": 5001, "limit": 1.003, "qty": 100.0, "ts": c.now(),
+         "s1x": 0.7, "m1s": 0.1, "p60": 3.0, "S5": 15000.0, "pm15": 2.5}
+    p.update(kw); return p
+def _mkst(pend):
+    return {"long": [], "short": [], "mom": [], "snap": [], "trend": [], "squeeze": [pend], "wins": 0, "losses": 0,
+            "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}, "slot_turn": ""}
+
+# paper: price trades up into the limit -> fill AT the limit; promoted OPEN with the catastrophe stop
+c.LIVE = False; c.price_now = lambda s: 1.004
+_pp = _mkpend(oid=None); _pst = _mkst(_pp); c.manage_squeeze(_pst)
+ok(_pp["state"] == "OPEN" and abs(_pp["entry"] - 1.003) < 1e-9 and _pp["stop"] > _pp["entry"],
+   "paper maker: price reached the limit -> OPEN at the limit, catastrophe stop above entry")
+# paper: TTL expiry below the limit -> taker-sim fallback at market px
+c.price_now = lambda s: 1.000
+_pp2 = _mkpend(oid=None, ts=c.now() - (c.SQF_MAKER_TTL_SEC + 5)); _pst2 = _mkst(_pp2); c.manage_squeeze(_pst2)
+ok(_pp2["state"] == "OPEN" and abs(_pp2["entry"] - 1.000) < 1e-9, "paper maker: TTL expiry -> taker-fallback fill at market")
+# paper: neither filled nor expired -> keeps waiting (state unchanged)
+_pp3 = _mkpend(oid=None); _pst3 = _mkst(_pp3); c.manage_squeeze(_pst3)
+ok(_pp3["state"] == "PENDING" and len(_pst3["squeeze"]) == 1, "paper maker: below limit, inside TTL -> keeps waiting")
+
+# LIVE: full fill -> promote at avgPrice, catastrophe stop rests (algoId tracked)
+c.LIVE = True; c.live_positions = lambda: {}
+_mka = {"can": [], "mkt": [], "stop": []}
+c.stop_market_buy = lambda sym, px: (_mka["stop"].append(px), {"algoId": 4242})[1]
+c.cancel = lambda sym, oid: (_mka["can"].append(oid), {"status": "CANCELED"})[1]
+c.order_status = lambda sym, oid: {"status": "FILLED", "executedQty": "100.0", "avgPrice": "1.0031"}
+_pl = _mkpend(); _sl1 = _mkst(_pl); c.manage_squeeze(_sl1)
+ok(_pl["state"] == "OPEN" and abs(_pl["entry"] - 1.0031) < 1e-9 and _pl["sl_oid"] == 4242 and _mka["stop"],
+   "LIVE maker: FILLED -> OPEN at avgPrice, catastrophe stop resting")
+# LIVE: partial fill -> remainder cancelled (orphan-fix pattern) + OPEN sized at executedQty
+_mka["can"].clear(); _mka["stop"].clear()
+c.order_status = lambda sym, oid: {"status": "PARTIALLY_FILLED", "executedQty": "40.0", "avgPrice": "1.0030"}
+_pl2 = _mkpend(); _sl2 = _mkst(_pl2); c.manage_squeeze(_sl2)
+ok(_pl2["state"] == "OPEN" and abs(_pl2["qty"] - 40.0) < 1e-9 and _mka["can"] == [5001],
+   "LIVE maker: PARTIAL -> remainder cancelled NOW (orphan-fix), OPEN sized at executedQty")
+# LIVE: TTL expiry, nothing filled -> cancel + taker fallback (the trade is never skipped)
+_mka["can"].clear()
+c.order_status = lambda sym, oid: {"status": "NEW", "executedQty": "0"}
+c.market_short = lambda sym, qty: (_mka["mkt"].append(qty), {"orderId": 7100, "executedQty": "100.0", "avgPrice": "1.0005"})[1]
+_pl3 = _mkpend(ts=c.now() - (c.SQF_MAKER_TTL_SEC + 5)); _sl3 = _mkst(_pl3); c.manage_squeeze(_sl3)
+ok(_pl3["state"] == "OPEN" and abs(_pl3["entry"] - 1.0005) < 1e-9 and _mka["can"] == [5001] and _mka["mkt"] == [100.0],
+   "LIVE maker: TTL -> cancel + taker fallback fill")
+# LIVE: fallback matches nothing -> pending removed, slot freed, no phantom (BUG-3 pattern)
+c.market_short = lambda sym, qty: {"orderId": 7101, "executedQty": "0"}
+c.order_status = lambda sym, oid: {"status": "NEW", "executedQty": "0"} if oid == 5001 else {"status": "EXPIRED", "executedQty": "0"}
+_pl4 = _mkpend(ts=c.now() - (c.SQF_MAKER_TTL_SEC + 5)); _sl4 = _mkst(_pl4); c.manage_squeeze(_sl4)
+ok(len(_sl4["squeeze"]) == 0, "LIVE maker: zero-fill fallback -> slot freed, no phantom position")
+# LIVE: cancelled-but-filled race -> opens WITH SL (BUG-1 pattern)
+c.order_status = lambda sym, oid: {"status": "CANCELED", "executedQty": "55.0", "avgPrice": "1.0029"}
+_pl5 = _mkpend(); _sl5 = _mkst(_pl5); c.manage_squeeze(_sl5)
+ok(_pl5["state"] == "OPEN" and abs(_pl5["qty"] - 55.0) < 1e-9, "LIVE maker: fill-on-cancel race -> OPEN with SL, never naked")
+c.LIVE = _svmk["live"]; c.SQF_MAKER = _svmk["mk"]; c.order_status = _svmk["os_"]; c.cancel = _svmk["ca"]
+c.market_short = _svmk["ms"]; c.stop_market_buy = _svmk["smb"]; c.specs = _svmk["sp"]; c.price_now = _svmk["pn"]
+c.live_positions = _svmk["lp"]; c._tg = _svmk["tg"]
 
 print(f"\n{'='*40}\n{P} passed, {F} failed")
 sys.exit(1 if F else 0)
