@@ -242,6 +242,17 @@ SQF_SL            = float(os.environ.get("SQF_SL", "0.04"))         # catastroph
 SQF_CAP           = int(os.environ.get("SQF_CAP", "0"))             # max concurrent squeeze-fades. 0 = engine takes no slots.
 SQF_COOLDOWN_MIN  = int(os.environ.get("SQF_COOLDOWN_MIN", "60"))   # one squeeze-fade per coin per this many minutes
 SQF_SCAN_MAX      = int(os.environ.get("SQF_SCAN_MAX", "12"))       # liq-call burst cap per 1m scan (top pumps first) — Coinalyze free tier safety
+# ===== E5 TRAIL (22-07, Artem's order, tuned on the 12 real night paths — grid + corrected sim, fill-bar contamination excluded):
+# arm the trail the moment favorable excursion reaches SQF_TRAIL_ACT (all 12 night trades were green >=0.3% early — Artem's thesis,
+# verified); width is TWO-PHASE: tight SQF_TRAIL_EARLY for the first SQF_TRAIL_EARLY_MIN minutes (banks instant spikes — Artem's
+# +$0.48-in-seconds case), then SQF_TRAIL after (0.75% flat beat 0.5/0.6 monotonically — squeeze reversion is noisy, grinders need
+# room). TIME60 + the +4% catastrophe stop REMAIN as backstops underneath. Night replay: -$1.88 actual -> ~+$0.28 under this config
+# (2 of 4 catastrophes become scratches; the 2 instant-death stops had no post-fill green and are unfixable by any trail).
+# SQF_TRAIL_ACT=0 (default) = trail OFF = byte-identical.
+SQF_TRAIL_ACT       = float(os.environ.get("SQF_TRAIL_ACT", "0"))
+SQF_TRAIL           = float(os.environ.get("SQF_TRAIL", "0.0075"))
+SQF_TRAIL_EARLY     = float(os.environ.get("SQF_TRAIL_EARLY", "0.003"))
+SQF_TRAIL_EARLY_MIN = int(os.environ.get("SQF_TRAIL_EARLY_MIN", "10"))
 
 # ========================= MOMENTUM LEG (v4 config A "Drive") — ported from momentum_engine.py =========================
 # THIRD strategy merged into the shared pool: LONG-ONLY multi-setup momentum on a MOVERS universe (full perp pool ranked
@@ -1049,10 +1060,18 @@ def manage_squeeze(st):
         sym = pos["coin"]; px = price_now(sym)
         if px is None: continue
         pos["maxadv"] = max(pos.get("maxadv", pos["entry"]), px)
+        pos["minlow"] = min(pos.get("minlow", pos["entry"]), px)         # best favorable since FILL (post-fill only — clean of the pre-fill-bar trap)
         amt = abs(realpos.get((sym, "SHORT"), 0.0)) if LIVE else pos["qty"]
         tag = None
         if px >= pos["stop"]: tag = "SL"
         elif now() - pos["fill_ts"] >= SQF_HOLD_MIN * 60: tag = "TIME"
+        elif SQF_TRAIL_ACT > 0:                                          # E5 TRAIL (Artem 22-07): arm on first green, two-phase width
+            if not pos.get("sq_armed") and (pos["entry"] - pos["minlow"]) / pos["entry"] >= SQF_TRAIL_ACT:
+                pos["sq_armed"] = True
+                log(f"SQF-TRAIL-ARM {sym} @ {fmt(px)} (fav {(pos['entry']-pos['minlow'])/pos['entry']*100:+.2f}%)")
+            if pos.get("sq_armed"):
+                w = SQF_TRAIL_EARLY if (now() - pos["fill_ts"]) < SQF_TRAIL_EARLY_MIN * 60 else SQF_TRAIL
+                if px >= pos["minlow"] * (1 + w): tag = "TRAIL"
         if LIVE and tag is None and amt < pos["qty"] * 0.5:
             # position gone from the exchange: native stop OR a manual close/ADL. Distinguish like the fade leg does —
             # only a fired stop counts as "SL" (feeds the breaker); a manual flatten books as "closed" (AUDIT LOW-1).

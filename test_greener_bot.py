@@ -1045,5 +1045,53 @@ c.price_now = _sva["pn"]; c.specs = _sva["sp"]; c.limit_buy_tp = _sva["tp"]; c.s
 c.market_short = _sva["ms"]; c.set_lev = _sva["sl"]; c.cancel_algo = _sva["cg"]; c.mkt_buy_close = _sva["mb"]
 c.real_close_fill = _sva["rc"]; c.algo_open_ids = _sva["ao"]; c.SQF_ENABLED = _sve["sqe"]
 
+print("\n=== E5 TRAIL (22-07): arm on first green, two-phase width, backstops intact ===")
+_svt = dict(a=c.SQF_TRAIL_ACT, w=c.SQF_TRAIL, e=c.SQF_TRAIL_EARLY, m=c.SQF_TRAIL_EARLY_MIN, live=c.LIVE, pn=c.price_now, lp=c.live_positions)
+c.LIVE = False; c.live_positions = lambda: {}
+def _tpos(fill_age_min=0, minlow=None, armed=None):
+    p = {"coin": "TRLUSDT", "state": "OPEN", "entry": 100.0, "qty": 1.0, "stop": 104.0, "sl_oid": None,
+         "ts": c.now(), "fill_ts": c.now() - fill_age_min*60, "maxadv": 100.0}
+    if minlow is not None: p["minlow"] = minlow
+    if armed is not None: p["sq_armed"] = armed
+    return p
+def _tst(pos):
+    return {"long": [], "short": [], "mom": [], "snap": [], "trend": [], "squeeze": [pos], "wins": 0, "losses": 0,
+            "realized": 0.0, "equity": 70.0, "last_sig": {}, "fade_sl_ts": {}, "fade_streak": 0}
+c.SQF_TRAIL_ACT = 0.003; c.SQF_TRAIL = 0.0075; c.SQF_TRAIL_EARLY = 0.003; c.SQF_TRAIL_EARLY_MIN = 10
+# 1) arms at fav, then EARLY width 0.3% exits on the bounce (first 10 min). Deep spike -> a real win after fees.
+p1 = _tpos(fill_age_min=2, minlow=99.0, armed=True)          # fav 1.0% -> armed; bounce past 99.0*1.003=99.297
+c.price_now = lambda s: 99.35                                 # px above the early trail stop -> TRAIL, ret +0.65-0.09 = win
+s1 = _tst(p1); c.manage_squeeze(s1)
+ok(len(s1["squeeze"]) == 0 and s1["wins"] == 1, "EARLY phase: armed trail banks the instant spike (TRAIL exit, win)")
+# 2) same bounce AFTER 10 min -> base width 0.75% -> NO exit
+p2 = _tpos(fill_age_min=15, minlow=99.6, armed=True)
+c.price_now = lambda s: 99.95                                 # 99.95 < 99.6*1.0075=100.347 -> no exit
+s2 = _tst(p2); c.manage_squeeze(s2)
+ok(len(s2["squeeze"]) == 1, "BASE phase: the same bounce does NOT exit at width 0.75% (grinders get room)")
+c.price_now = lambda s: 100.40                                # above 100.347 -> TRAIL fires at base width
+c.manage_squeeze(s2)
+ok(len(s2["squeeze"]) == 0, "BASE phase: a 0.75%-bounce off the low DOES exit")
+# 3) arming: not armed below ACT; arms at ACT; minlow tracked from price polls
+p3 = _tpos(fill_age_min=1)
+c.price_now = lambda s: 99.75                                 # fav 0.25% < 0.3 -> tracks minlow, no arm
+s3 = _tst(p3); c.manage_squeeze(s3)
+ok(len(s3["squeeze"]) == 1 and not s3["squeeze"][0].get("sq_armed"), "below ACT: minlow tracks, trail NOT armed")
+c.price_now = lambda s: 99.65                                 # fav 0.35% -> arms
+c.manage_squeeze(s3)
+ok(s3["squeeze"][0].get("sq_armed") is True, "at ACT +0.3%: trail arms")
+# 4) catastrophe stop still wins pre-arm
+p4 = _tpos(fill_age_min=1)
+c.price_now = lambda s: 104.2
+s4 = _tst(p4); c.manage_squeeze(s4)
+ok(len(s4["squeeze"]) == 0 and s4["losses"] == 1, "catastrophe +4% still fires (backstop intact)")
+# 5) OFF default: SQF_TRAIL_ACT=0 -> byte-identical (no arm, no trail exit)
+c.SQF_TRAIL_ACT = 0.0
+p5 = _tpos(fill_age_min=2, minlow=99.0)
+c.price_now = lambda s: 99.9                                  # would be a deep-armed trail exit if ON
+s5 = _tst(p5); c.manage_squeeze(s5)
+ok(len(s5["squeeze"]) == 1 and not s5["squeeze"][0].get("sq_armed"), "SQF_TRAIL_ACT=0 (default): trail fully inert")
+c.SQF_TRAIL_ACT = _svt["a"]; c.SQF_TRAIL = _svt["w"]; c.SQF_TRAIL_EARLY = _svt["e"]; c.SQF_TRAIL_EARLY_MIN = _svt["m"]
+c.LIVE = _svt["live"]; c.price_now = _svt["pn"]; c.live_positions = _svt["lp"]
+
 print(f"\n{'='*40}\n{P} passed, {F} failed")
 sys.exit(1 if F else 0)
